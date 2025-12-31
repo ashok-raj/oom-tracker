@@ -49,6 +49,7 @@ Your system was experiencing overnight logouts caused by the Linux OOM killer te
 - **Memory Status Check** - View current memory usage and top consumers
 - **Browser Listing** - List all running browser instances with memory details
 - **OOM Analysis** - Analyze historical dmesg logs to identify past OOM events and root causes
+- **Service Management** - Enable, disable, check status, and view logs directly from the tool
 - **Flexible Configuration** - Override config file settings via command-line arguments
 
 ## Quick Start
@@ -61,10 +62,10 @@ python3 ~/Utils/oom-tracker/memory_monitor.py --check
 python3 ~/Utils/oom-tracker/memory_monitor.py --dry-run --threshold 50
 
 # 3. Enable automated monitoring
-systemctl --user enable --now oom-tracker.timer
+python3 ~/Utils/oom-tracker/memory_monitor.py --enable-service
 
 # 4. Monitor the logs
-journalctl --user -u oom-tracker.service -f
+python3 ~/Utils/oom-tracker/memory_monitor.py --logs
 ```
 
 ## Use Cases
@@ -266,6 +267,29 @@ python3 ~/Utils/oom-tracker/memory_monitor.py --dry-run --threshold 50
 python3 ~/Utils/oom-tracker/memory_monitor.py --config /path/to/custom-config.yaml
 ```
 
+### Service Management
+
+Manage the systemd service directly from the command line:
+
+```bash
+# Enable and start the service
+python3 ~/Utils/oom-tracker/memory_monitor.py --enable-service
+
+# Check service status
+python3 ~/Utils/oom-tracker/memory_monitor.py --service-status
+
+# View recent logs (last 50 lines)
+python3 ~/Utils/oom-tracker/memory_monitor.py --logs
+
+# Follow logs in real-time (Ctrl+C to exit)
+python3 ~/Utils/oom-tracker/memory_monitor.py --follow-logs
+
+# Disable and stop the service
+python3 ~/Utils/oom-tracker/memory_monitor.py --disable-service
+```
+
+These commands are simpler alternatives to using `systemctl` and `journalctl` directly.
+
 ### All Available Options
 
 | Option | Description |
@@ -278,6 +302,12 @@ python3 ~/Utils/oom-tracker/memory_monitor.py --config /path/to/custom-config.ya
 | `--dry-run` | Test mode - log actions without killing processes |
 | `--threshold N` | Override memory threshold (0-100) |
 | `--config PATH` | Use alternate configuration file |
+| **Service Management** | |
+| `--enable-service` | Enable and start the systemd timer |
+| `--disable-service` | Disable and stop the systemd timer |
+| `--service-status` | Show service and timer status |
+| `--logs` | View recent logs from the service |
+| `--follow-logs` | Follow logs in real-time |
 
 ### View Logs
 
@@ -483,7 +513,16 @@ systemctl --user daemon-reload
 
 ## Version History
 
-### Version 1.1.0 (Current)
+### Version 1.2.0 (Current)
+- Added built-in service management commands
+- Added `--enable-service` to enable and start systemd timer
+- Added `--disable-service` to disable and stop systemd timer
+- Added `--service-status` to show service and timer status
+- Added `--logs` to view recent service logs
+- Added `--follow-logs` to watch logs in real-time
+- Simplified user experience - no need to remember systemctl/journalctl commands
+
+### Version 1.1.0
 - Added command-line interface with argparse
 - Added `--check` mode for memory status checking
 - Added `--list-browsers` mode for browser memory analysis
@@ -492,7 +531,7 @@ systemctl --user daemon-reload
 - Improved error handling and user feedback
 - Added support for analyzing both gzipped and plain text dmesg logs
 
-### Version 1.0.0 (Initial)
+### Version 1.0.0
 - Automated proactive memory monitoring via systemd timer
 - Browser process detection and graceful termination
 - Configurable thresholds and behavior via YAML config

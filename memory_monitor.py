@@ -12,6 +12,7 @@ import logging
 import argparse
 import gzip
 import re
+import subprocess
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
@@ -22,7 +23,7 @@ import signal
 
 
 # Configuration
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / 'config.yaml'
 LOG_DIR = SCRIPT_DIR / 'logs'
@@ -93,6 +94,38 @@ def setup_argparse():
         metavar='PATH',
         type=str,
         help='Analyze gzipped or plain text dmesg log file for OOM events and likely causes'
+    )
+
+    # Service management options
+    service_group = parser.add_argument_group('service management')
+    service_group.add_argument(
+        '--enable-service',
+        action='store_true',
+        help='Enable and start the systemd timer for automated monitoring'
+    )
+
+    service_group.add_argument(
+        '--disable-service',
+        action='store_true',
+        help='Disable and stop the systemd timer'
+    )
+
+    service_group.add_argument(
+        '--service-status',
+        action='store_true',
+        help='Show systemd service and timer status'
+    )
+
+    service_group.add_argument(
+        '--logs',
+        action='store_true',
+        help='View recent logs from the service'
+    )
+
+    service_group.add_argument(
+        '--follow-logs',
+        action='store_true',
+        help='Follow logs in real-time (use with --logs or alone)'
     )
 
     args = parser.parse_args()
@@ -525,6 +558,128 @@ def analyze_dmesg_mode(file_path):
         print("="*60)
 
 
+def enable_service():
+    """Enable and start the systemd timer."""
+    print("Enabling OOM Tracker service...")
+    print()
+
+    try:
+        # Enable and start the timer
+        result = subprocess.run(
+            ['systemctl', '--user', 'enable', '--now', 'oom-tracker.timer'],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print("✓ Service enabled and started successfully")
+            print()
+
+            # Show status
+            subprocess.run(['systemctl', '--user', 'status', 'oom-tracker.timer', '--no-pager'])
+
+            print()
+            print("The OOM tracker will now run every 60 seconds.")
+            print("View logs with: python3 memory_monitor.py --logs")
+        else:
+            print(f"✗ Failed to enable service: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+    except FileNotFoundError:
+        print("Error: systemctl not found. Is systemd installed?", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def disable_service():
+    """Disable and stop the systemd timer."""
+    print("Disabling OOM Tracker service...")
+    print()
+
+    try:
+        # Disable and stop the timer
+        result = subprocess.run(
+            ['systemctl', '--user', 'disable', '--now', 'oom-tracker.timer'],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print("✓ Service disabled and stopped successfully")
+            print()
+            print("The OOM tracker will no longer run automatically.")
+            print("You can re-enable it with: python3 memory_monitor.py --enable-service")
+        else:
+            print(f"✗ Failed to disable service: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+    except FileNotFoundError:
+        print("Error: systemctl not found. Is systemd installed?", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def service_status():
+    """Show the status of the systemd service and timer."""
+    print("="*60)
+    print("OOM TRACKER SERVICE STATUS")
+    print("="*60)
+    print()
+
+    try:
+        # Check timer status
+        print("Timer Status:")
+        print("-" * 60)
+        subprocess.run(['systemctl', '--user', 'status', 'oom-tracker.timer', '--no-pager'])
+
+        print()
+        print("Upcoming Runs:")
+        print("-" * 60)
+        subprocess.run(['systemctl', '--user', 'list-timers', 'oom-tracker.timer', '--no-pager'])
+
+        print()
+        print("Recent Service Runs:")
+        print("-" * 60)
+        subprocess.run(['systemctl', '--user', 'status', 'oom-tracker.service', '--no-pager', '-n', '0'])
+
+    except FileNotFoundError:
+        print("Error: systemctl not found. Is systemd installed?", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def show_logs(follow=False):
+    """Show logs from the systemd service."""
+    try:
+        if follow:
+            print("Following OOM Tracker logs (Ctrl+C to exit)...")
+            print()
+            subprocess.run(['journalctl', '--user', '-u', 'oom-tracker.service', '-f'])
+        else:
+            print("="*60)
+            print("OOM TRACKER RECENT LOGS")
+            print("="*60)
+            print()
+            subprocess.run(['journalctl', '--user', '-u', 'oom-tracker.service', '--no-pager', '-n', '50'])
+            print()
+            print("Tip: Use --follow-logs to watch logs in real-time")
+
+    except FileNotFoundError:
+        print("Error: journalctl not found. Is systemd installed?", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nStopped following logs")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def check_memory_mode():
     """Check memory status and display information without taking action."""
     print("="*60)
@@ -625,6 +780,24 @@ def main(args=None):
     """Main monitoring function."""
     # Handle special modes that exit early
     if args:
+        # Service management modes
+        if args.enable_service:
+            enable_service()
+            return
+
+        if args.disable_service:
+            disable_service()
+            return
+
+        if args.service_status:
+            service_status()
+            return
+
+        if args.logs or args.follow_logs:
+            show_logs(follow=args.follow_logs)
+            return
+
+        # Analysis and info modes
         if args.analyze_dmesg:
             analyze_dmesg_mode(args.analyze_dmesg)
             return
