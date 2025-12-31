@@ -1,0 +1,16 @@
+# OOM Tracker Configuration
+
+# Memory threshold percentage (0-100)
+# When system memory usage exceeds this threshold, the tool will kill browsers
+memory_threshold_percent: 90
+
+# How long to wait after sending SIGTERM before sending SIGKILL (seconds)
+kill_timeout_seconds: 30
+
+# Logging configuration
+log_level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+log_max_bytes: 10485760  # 10MB
+log_backup_count: 5  # Keep 5 backup log files
+
+# Dry run mode - if true, will only log what it would do without actually killing processes
+dry_run: false
