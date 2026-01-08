@@ -23,7 +23,7 @@ import signal
 
 
 # Configuration
-VERSION = '1.2.0'
+VERSION = '1.4.0'
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / 'config.yaml'
 LOG_DIR = SCRIPT_DIR / 'logs'
@@ -90,10 +90,37 @@ def setup_argparse():
     )
 
     parser.add_argument(
+        '--list-tabs',
+        action='store_true',
+        help='List all browser tabs (renderer processes) with memory usage, then exit'
+    )
+
+    parser.add_argument(
         '--analyze-dmesg',
         metavar='PATH',
         type=str,
         help='Analyze gzipped or plain text dmesg log file for OOM events and likely causes'
+    )
+
+    parser.add_argument(
+        '--analyze-oom',
+        metavar='DAYS',
+        type=int,
+        nargs='?',
+        const=7,
+        help='Analyze journalctl logs for OOM events from past N days (default: 7)'
+    )
+
+    parser.add_argument(
+        '--protect-session',
+        action='store_true',
+        help='Configure OOM score adjustments to protect critical session processes'
+    )
+
+    parser.add_argument(
+        '--show-oom-scores',
+        action='store_true',
+        help='Show OOM scores for all running processes'
     )
 
     # Service management options
@@ -351,6 +378,158 @@ def kill_browser_instance(browser_tree, timeout_seconds, dry_run=False):
         result['error'] = str(e)
 
     return result
+
+
+def find_browser_tabs(browser_type, current_username):
+    """Find all tab processes for a specific browser type."""
+    tabs = []
+
+    for proc in psutil.process_iter(['pid', 'name', 'username', 'cmdline', 'memory_info']):
+        try:
+            info = proc.info
+
+            # Skip if not current user
+            if info['username'] != current_username:
+                continue
+
+            # Check if it's a browser process
+            detected_browser = identify_browser(info['name'], info['cmdline'])
+            if detected_browser != browser_type:
+                continue
+
+            # Check if it's a renderer process (tab)
+            cmdline_str = ' '.join(info['cmdline']) if info['cmdline'] else ''
+            if '--type=renderer' not in cmdline_str:
+                continue
+
+            # Get memory usage
+            memory_mb = info['memory_info'].rss / (1024**2)
+
+            tabs.append({
+                'pid': info['pid'],
+                'name': info['name'],
+                'memory_mb': memory_mb,
+                'process': proc
+            })
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # Sort by memory usage (highest first)
+    tabs.sort(key=lambda x: x['memory_mb'], reverse=True)
+    return tabs
+
+
+def kill_browser_tab(tab, dry_run=False):
+    """Kill a single browser tab (renderer process)."""
+    result = {
+        'pid': tab['pid'],
+        'memory_freed_mb': tab['memory_mb'],
+        'success': False,
+        'method': None
+    }
+
+    if dry_run:
+        result['success'] = True
+        result['method'] = 'DRY_RUN'
+        return result
+
+    try:
+        proc = tab['process']
+        # Force kill tab immediately (SIGKILL)
+        # Tabs don't need graceful shutdown - they'll show "Aw, Snap!"
+        proc.kill()
+        result['method'] = 'SIGKILL'
+
+        # Wait briefly to ensure it's dead
+        try:
+            proc.wait(timeout=2)
+            result['success'] = True
+        except psutil.TimeoutExpired:
+            result['success'] = False
+
+    except psutil.NoSuchProcess:
+        # Process already died
+        result['success'] = True
+        result['method'] = 'ALREADY_DEAD'
+    except psutil.AccessDenied as e:
+        result['success'] = False
+        result['error'] = str(e)
+
+    return result
+
+
+def kill_tabs_strategy(browser_trees, config, logger, current_username):
+    """
+    Strategy B: Kill individual tabs before killing entire browser.
+    Returns True if tabs were killed, False if we should kill the browser instead.
+    """
+    tab_threshold_mb = config.get('tab_memory_threshold_mb', 300)
+    max_tabs = config.get('max_tabs_to_kill', 3)
+    interval_seconds = config.get('tab_kill_interval_seconds', 5)
+    dry_run = config.get('dry_run', False)
+
+    tabs_killed = 0
+    total_memory_freed = 0
+
+    # Find the browser instance with the most memory
+    if not browser_trees:
+        return False
+
+    target_pid, target_tree = max(browser_trees.items(),
+                                   key=lambda x: x[1]['total_memory_mb'])
+    browser_type = target_tree['browser_type']
+
+    logger.info(f"Using tab-killing strategy for {browser_type.upper()} (PID {target_pid})")
+
+    # Find all tabs for this browser
+    tabs = find_browser_tabs(browser_type, current_username)
+
+    if not tabs:
+        logger.warning(f"No tabs found for {browser_type.upper()}")
+        return False
+
+    logger.info(f"Found {len(tabs)} tab(s) for {browser_type.upper()}")
+
+    # Filter tabs by memory threshold
+    eligible_tabs = [t for t in tabs if t['memory_mb'] >= tab_threshold_mb]
+
+    if not eligible_tabs:
+        logger.info(f"No tabs exceed threshold of {tab_threshold_mb} MB")
+        return False
+
+    logger.info(f"{len(eligible_tabs)} tab(s) exceed {tab_threshold_mb} MB threshold")
+
+    # Kill up to max_tabs_to_kill tabs
+    for i, tab in enumerate(eligible_tabs[:max_tabs]):
+        logger.warning(f"Killing tab {i+1}/{max_tabs}: PID {tab['pid']} "
+                      f"using {tab['memory_mb']:.1f} MB")
+
+        result = kill_browser_tab(tab, dry_run=dry_run)
+
+        if result['success']:
+            tabs_killed += 1
+            total_memory_freed += result['memory_freed_mb']
+            logger.info(f"Successfully killed tab PID {result['pid']} "
+                       f"using method: {result['method']}")
+        else:
+            logger.error(f"Failed to kill tab PID {result['pid']}")
+            if 'error' in result:
+                logger.error(f"Error: {result['error']}")
+
+        # Wait between kills if not the last one
+        if i < len(eligible_tabs[:max_tabs]) - 1:
+            logger.info(f"Waiting {interval_seconds}s before killing next tab...")
+            if not dry_run:
+                time.sleep(interval_seconds)
+
+    logger.info(f"Killed {tabs_killed} tab(s), freed approximately {total_memory_freed:.1f} MB")
+
+    # Check if we killed any tabs
+    if tabs_killed > 0:
+        return True
+    else:
+        return False
 
 
 def parse_oom_events(file_path):
@@ -776,6 +955,479 @@ def list_browsers_mode():
     print("="*60)
 
 
+def list_tabs_mode():
+    """List all browser tabs (renderer processes) with memory usage."""
+    print("="*60)
+    print("BROWSER TABS MEMORY USAGE")
+    print("="*60)
+
+    current_username = psutil.Process().username()
+
+    # Find all browser types
+    all_tabs = {}
+    for browser_type in ['chrome', 'firefox', 'brave', 'edge', 'opera', 'vivaldi']:
+        tabs = find_browser_tabs(browser_type, current_username)
+        if tabs:
+            all_tabs[browser_type] = tabs
+
+    if not all_tabs:
+        print("\nNo browser tabs found running under user:", current_username)
+        print("="*60)
+        return
+
+    total_tabs = sum(len(tabs) for tabs in all_tabs.values())
+    total_memory = sum(sum(t['memory_mb'] for t in tabs) for tabs in all_tabs.values())
+
+    print(f"\nFound {total_tabs} tab(s) across {len(all_tabs)} browser(s)")
+    print(f"Total tab memory: {total_memory:.1f} MB\n")
+
+    # Display tabs by browser
+    for browser_type, tabs in sorted(all_tabs.items()):
+        browser_memory = sum(t['memory_mb'] for t in tabs)
+        print(f"\n{browser_type.upper()} - {len(tabs)} tab(s), {browser_memory:.1f} MB total")
+        print("-"*60)
+
+        # Show all tabs sorted by memory
+        for i, tab in enumerate(tabs, 1):
+            marker = "  "
+            # Mark tabs that would be killed with current config
+            config = load_config()
+            threshold = config.get('tab_memory_threshold_mb', 300)
+            if tab['memory_mb'] >= threshold:
+                marker = "→ "  # This tab exceeds threshold
+
+            print(f"{marker}{i:>2}. PID {tab['pid']:<8} - {tab['memory_mb']:>8.1f} MB")
+
+    # Show configuration
+    print(f"\n{'='*60}")
+    print("CONFIGURATION")
+    print(f"{'='*60}")
+    config = load_config()
+    kill_mode = config.get('kill_mode', 'browser')
+    threshold = config.get('tab_memory_threshold_mb', 300)
+    max_tabs = config.get('max_tabs_to_kill', 3)
+
+    print(f"Kill mode:           {kill_mode}")
+    print(f"Tab threshold:       {threshold} MB")
+    print(f"Max tabs to kill:    {max_tabs}")
+
+    # Show which tabs would be killed
+    eligible_tabs = []
+    for tabs in all_tabs.values():
+        eligible_tabs.extend([t for t in tabs if t['memory_mb'] >= threshold])
+    eligible_tabs.sort(key=lambda x: x['memory_mb'], reverse=True)
+
+    if kill_mode == 'tab' and eligible_tabs:
+        print(f"\nTabs that would be killed (marked with →):")
+        print(f"  {len(eligible_tabs[:max_tabs])} tab(s) eligible for killing")
+        print(f"  Would free: {sum(t['memory_mb'] for t in eligible_tabs[:max_tabs]):.1f} MB")
+    elif kill_mode == 'tab':
+        print(f"\nNo tabs exceed the {threshold} MB threshold")
+    else:
+        print(f"\nTab killing disabled (kill_mode={kill_mode})")
+
+    print("="*60)
+
+
+def analyze_journalctl_oom(days=7):
+    """Analyze journalctl logs for OOM events with detailed timeline."""
+    print("="*70)
+    print(f"SYSTEM OOM ANALYSIS - LAST {days} DAYS")
+    print("="*70)
+
+    try:
+        # Query journalctl for OOM events
+        since_date = datetime.now().timestamp() - (days * 86400)
+        result = subprocess.run(
+            ['journalctl', '-k', '--since', f'{days} days ago', '--no-pager'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"Error querying journalctl: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+        lines = result.stdout.splitlines()
+
+    except subprocess.TimeoutExpired:
+        print("Error: journalctl query timed out", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError:
+        print("Error: journalctl not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse OOM events
+    oom_events = []
+    current_event = None
+    task_list_processes = []
+
+    timestamp_re = re.compile(r'^(\w+\s+\d+\s+\d+:\d+:\d+)')
+    oom_killer_re = re.compile(r'invoked oom-killer')
+    trigger_process_re = re.compile(r'CPU:\s+\d+\s+PID:\s+(\d+)\s+Comm:\s+(\S+)')
+    killed_process_re = re.compile(r'Out of memory: Killed process (\d+) \(([^)]+)\).*?total-vm:(\d+)kB.*?(?:anon-rss|rss):(\d+)kB')
+    mem_info_re = re.compile(r'(active_anon|inactive_anon|active_file|inactive_file):(\d+)')
+    task_entry_re = re.compile(r'\[\s*(\d+)\]\s+\d+\s+\d+\s+(\d+)\s+(\d+).*?\s+\d+\s+(\S+)\s*$')
+
+    for line in lines:
+        # Extract timestamp
+        ts_match = timestamp_re.match(line)
+        timestamp = ts_match.group(1) if ts_match else None
+
+        # Start of new OOM event
+        if oom_killer_re.search(line):
+            if current_event and current_event.get('killed_process'):
+                oom_events.append(current_event)
+
+            current_event = {
+                'timestamp': timestamp or 'unknown',
+                'trigger_process': None,
+                'trigger_pid': None,
+                'killed_process': None,
+                'killed_pid': None,
+                'total_vm_kb': 0,
+                'rss_kb': 0,
+                'memory_stats': {},
+                'top_consumers': []
+            }
+            task_list_processes = []
+
+        if not current_event:
+            continue
+
+        # Trigger process info
+        trigger_match = trigger_process_re.search(line)
+        if trigger_match and not current_event.get('trigger_pid'):
+            current_event['trigger_pid'] = int(trigger_match.group(1))
+            current_event['trigger_process'] = trigger_match.group(2)
+
+        # Killed process info
+        killed_match = killed_process_re.search(line)
+        if killed_match:
+            current_event['killed_pid'] = int(killed_match.group(1))
+            current_event['killed_process'] = killed_match.group(2)
+            current_event['total_vm_kb'] = int(killed_match.group(3))
+            current_event['rss_kb'] = int(killed_match.group(4))
+
+        # Memory stats
+        for mem_match in mem_info_re.finditer(line):
+            stat_name = mem_match.group(1)
+            stat_value = int(mem_match.group(2))
+            current_event['memory_stats'][stat_name] = stat_value
+
+        # Task list entries
+        task_match = task_entry_re.search(line)
+        if task_match:
+            task_list_processes.append({
+                'pid': int(task_match.group(1)),
+                'total_vm_kb': int(task_match.group(2)),
+                'rss_kb': int(task_match.group(3)),
+                'name': task_match.group(4)
+            })
+
+    # Save last event
+    if current_event and current_event.get('killed_process'):
+        current_event['top_consumers'] = sorted(
+            task_list_processes,
+            key=lambda x: x['rss_kb'],
+            reverse=True
+        )[:10]
+        oom_events.append(current_event)
+
+    if not oom_events:
+        print(f"\n✓ No OOM events found in the last {days} days")
+        print("\nYour system has been stable!")
+        print("="*70)
+        return
+
+    print(f"\n⚠ Found {len(oom_events)} OOM event(s)\n")
+
+    # Display timeline
+    print("TIMELINE OF OOM EVENTS")
+    print("-"*70)
+    for idx, event in enumerate(oom_events, 1):
+        print(f"\n{idx}. {event['timestamp']}")
+        print(f"   Killed: {event['killed_process']} (PID {event['killed_pid']}) - "
+              f"Freed {event['rss_kb'] / 1024:.1f} MB")
+        if event['trigger_process']:
+            print(f"   Triggered by: {event['trigger_process']} (PID {event['trigger_pid']})")
+
+    # Detailed analysis of most recent event
+    latest_event = oom_events[-1]
+    print(f"\n\n{'='*70}")
+    print("MOST RECENT OOM EVENT - DETAILED ANALYSIS")
+    print(f"{'='*70}")
+    print(f"\nTimestamp:       {latest_event['timestamp']}")
+
+    if latest_event['trigger_process']:
+        print(f"Triggered by:    {latest_event['trigger_process']} (PID {latest_event['trigger_pid']})")
+
+    print(f"Killed process:  {latest_event['killed_process']} (PID {latest_event['killed_pid']})")
+    print(f"Memory freed:    {latest_event['rss_kb'] / 1024:.1f} MB (RSS)")
+
+    if latest_event['top_consumers']:
+        print(f"\nTop {min(5, len(latest_event['top_consumers']))} Memory Consumers at Time of OOM:")
+        for i, proc in enumerate(latest_event['top_consumers'][:5], 1):
+            print(f"  {i}. {proc['name']:<20} (PID {proc['pid']:<6}) - {proc['rss_kb'] / 1024:>8.1f} MB")
+
+    # Root cause analysis
+    print(f"\n\n{'='*70}")
+    print("ROOT CAUSE ANALYSIS")
+    print(f"{'='*70}")
+
+    # Count killed processes
+    killed_counts = defaultdict(int)
+    for event in oom_events:
+        killed_counts[event['killed_process']] += 1
+
+    print("\nProcesses Killed by OOM Killer:")
+    for proc_name, count in sorted(killed_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  • {proc_name}: {count} time(s)")
+
+    # Find consistent memory consumers
+    all_consumers = defaultdict(list)
+    for event in oom_events:
+        for consumer in event['top_consumers']:
+            all_consumers[consumer['name']].append(consumer['rss_kb'])
+
+    if all_consumers:
+        print(f"\nLikely Root Cause (Top Memory Consumers Across All Events):")
+        consumer_stats = []
+        for name, rss_list in all_consumers.items():
+            consumer_stats.append({
+                'name': name,
+                'avg_mb': sum(rss_list) / len(rss_list) / 1024,
+                'max_mb': max(rss_list) / 1024,
+                'count': len(rss_list),
+                'total_events': len(oom_events)
+            })
+
+        consumer_stats.sort(key=lambda x: x['avg_mb'], reverse=True)
+
+        for i, stat in enumerate(consumer_stats[:5], 1):
+            print(f"  {i}. {stat['name']:<20} - Avg: {stat['avg_mb']:>6.1f} MB, "
+                  f"Max: {stat['max_mb']:>6.1f} MB "
+                  f"(in {stat['count']}/{stat['total_events']} events)")
+
+    # Recommendations
+    print(f"\n{'='*70}")
+    print("RECOMMENDATIONS")
+    print(f"{'='*70}")
+
+    # Check if session processes were killed
+    session_procs = ['gnome-shell', 'gnome-session', 'nautilus', 'systemd']
+    session_killed = [p for p in killed_counts.keys() if any(sp in p.lower() for sp in session_procs)]
+
+    if session_killed:
+        print("\n⚠  CRITICAL: Session processes were killed, causing logout!")
+        print(f"   Killed: {', '.join(session_killed)}")
+        print("\n   To prevent future logouts:")
+        print("   1. Run: python3 memory_monitor.py --protect-session")
+        print("      This adjusts OOM scores to protect critical session processes")
+        print("   2. Let the OOM tracker kill browsers proactively before kernel OOM")
+
+    # Check browser memory
+    browser_procs = ['chrome', 'firefox', 'brave', 'edge']
+    if any(any(bp in name.lower() for bp in browser_procs) for name in all_consumers.keys()):
+        print("\n   Browser memory consumption detected:")
+        print("   • Enable OOM tracker service to kill browsers before system OOM")
+        print("   • Consider closing browsers when not in use")
+        print("   • Use browser extensions to suspend inactive tabs")
+
+    # General recommendations
+    total_mem_gb = psutil.virtual_memory().total / (1024**3)
+    if total_mem_gb < 32:
+        print(f"\n   Your system has {total_mem_gb:.0f}GB RAM. Consider:")
+        print("   • Adding more physical RAM")
+        print("   • Increasing swap space")
+
+    print("\n   Immediate actions:")
+    print("   • Enable OOM tracker: python3 memory_monitor.py --enable-service")
+    print("   • Monitor memory: python3 memory_monitor.py --check")
+    print("="*70)
+
+
+def show_oom_scores():
+    """Show OOM scores for all running processes."""
+    print("="*70)
+    print("PROCESS OOM SCORES")
+    print("="*70)
+    print("\nOOM Score Guide:")
+    print("  -1000 = Never kill (kernel processes)")
+    print("   -900 = System critical (disable OOM killer)")
+    print("   -100 = Protected from OOM")
+    print("      0 = Normal priority (default)")
+    print("    200 = Prefer to kill (desktop apps)")
+    print("   1000 = Kill first")
+    print()
+
+    processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'username']):
+        try:
+            pid = proc.info['pid']
+            oom_score_adj_file = f'/proc/{pid}/oom_score_adj'
+            oom_score_file = f'/proc/{pid}/oom_score'
+
+            try:
+                with open(oom_score_adj_file, 'r') as f:
+                    oom_score_adj = int(f.read().strip())
+                with open(oom_score_file, 'r') as f:
+                    oom_score = int(f.read().strip())
+
+                processes.append({
+                    'pid': pid,
+                    'name': proc.info['name'],
+                    'username': proc.info['username'],
+                    'oom_score_adj': oom_score_adj,
+                    'oom_score': oom_score
+                })
+            except (FileNotFoundError, PermissionError):
+                continue
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # Sort by oom_score (higher = more likely to be killed)
+    processes.sort(key=lambda x: x['oom_score'], reverse=True)
+
+    print(f"Top 20 processes most likely to be killed by OOM:")
+    print(f"{'PID':<8} {'OOM Score':<10} {'Adj':<6} {'User':<12} {'Process':<30}")
+    print("-"*70)
+
+    for proc in processes[:20]:
+        print(f"{proc['pid']:<8} {proc['oom_score']:<10} {proc['oom_score_adj']:<6} "
+              f"{proc['username']:<12} {proc['name']:<30}")
+
+    # Show protected processes
+    protected = [p for p in processes if p['oom_score_adj'] < 0]
+    if protected:
+        print(f"\n\nProtected processes (OOM score < 0):")
+        print(f"{'PID':<8} {'OOM Score':<10} {'Adj':<6} {'User':<12} {'Process':<30}")
+        print("-"*70)
+        for proc in sorted(protected, key=lambda x: x['oom_score_adj']):
+            print(f"{proc['pid']:<8} {proc['oom_score']:<10} {proc['oom_score_adj']:<6} "
+                  f"{proc['username']:<12} {proc['name']:<30}")
+
+    print("="*70)
+
+
+def protect_session_processes():
+    """Configure OOM score adjustments to protect critical session processes."""
+    print("="*70)
+    print("CONFIGURING OOM PROTECTION FOR SESSION PROCESSES")
+    print("="*70)
+
+    # Critical processes to protect (regardless of user)
+    protect_patterns = [
+        ('systemd', -100, 'User session manager'),
+        ('gnome-shell', -100, 'GNOME desktop shell'),
+        ('gnome-session', -100, 'GNOME session manager'),
+        ('gdm', -100, 'Display manager'),
+        ('sshd', -100, 'SSH daemon'),
+        ('dbus-daemon', -100, 'D-Bus message bus'),
+        ('nautilus', -50, 'File manager'),
+    ]
+
+    # Processes to make more killable (browsers)
+    prefer_kill_patterns = [
+        ('chrome', 300, 'Chrome browser'),
+        ('firefox', 300, 'Firefox browser'),
+        ('brave', 300, 'Brave browser'),
+        ('msedge', 300, 'Edge browser'),
+    ]
+
+    current_user = psutil.Process().username()
+    protected_count = 0
+    adjusted_count = 0
+    permission_errors = []
+
+    print(f"\nScanning ALL user processes (running as: {current_user})\n")
+
+    for proc in psutil.process_iter(['pid', 'name', 'username']):
+        try:
+            pid = proc.info['pid']
+            name = proc.info['name']
+            username = proc.info['username']
+            oom_adj_file = f'/proc/{pid}/oom_score_adj'
+
+            # Check if process should be protected
+            for pattern, score, description in protect_patterns:
+                if pattern in name.lower():
+                    try:
+                        # Read current score
+                        with open(oom_adj_file, 'r') as f:
+                            current_score = int(f.read().strip())
+
+                        # Only adjust if not already protected
+                        if current_score >= 0:
+                            with open(oom_adj_file, 'w') as f:
+                                f.write(str(score))
+                            print(f"✓ Protected: {name:<25} (PID {pid:<7} User: {username}) - {description}")
+                            print(f"  OOM score adjusted: {current_score} → {score}")
+                            protected_count += 1
+                        elif current_score < -50:
+                            # Only mention already-protected if strongly protected
+                            print(f"  Already protected: {name:<25} (PID {pid}) - score: {current_score}")
+                    except PermissionError:
+                        permission_errors.append((name, pid, username))
+                    except Exception as e:
+                        print(f"✗ Error: {name} (PID {pid}): {e}")
+                    break
+
+            # Check if process should be preferred for killing (only for non-root users)
+            if username != 'root':
+                for pattern, score, description in prefer_kill_patterns:
+                    if pattern in name.lower():
+                        try:
+                            with open(oom_adj_file, 'r') as f:
+                                current_score = int(f.read().strip())
+
+                            if current_score < 300:
+                                with open(oom_adj_file, 'w') as f:
+                                    f.write(str(score))
+                                print(f"  Adjusted: {name:<25} (PID {pid:<7} User: {username}) - {description}")
+                                print(f"  OOM score: {current_score} → {score} (prefer to kill)")
+                                adjusted_count += 1
+                        except (PermissionError, Exception):
+                            pass  # Silently skip permission errors for browsers
+                        break
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print(f"{'='*70}")
+    print(f"Protected {protected_count} critical session process(es)")
+    print(f"Adjusted {adjusted_count} browser process(es) to be preferred OOM targets")
+
+    if permission_errors:
+        print(f"\n⚠  Permission denied for {len(permission_errors)} process(es):")
+        for name, pid, username in permission_errors[:5]:
+            print(f"  • {name} (PID {pid}, User: {username})")
+        if len(permission_errors) > 5:
+            print(f"  ... and {len(permission_errors) - 5} more")
+        print("\n  Run with sudo to protect all processes:")
+        print(f"  sudo python3 {sys.argv[0]} --protect-session")
+
+    if protected_count == 0 and adjusted_count == 0 and not permission_errors:
+        print("\nNo processes were adjusted. This could mean:")
+        print("  • Critical processes are already protected")
+        print("  • Processes are not currently running")
+    elif protected_count > 0 or adjusted_count > 0:
+        print("\n✓ Session processes protection configured")
+        print("  Critical session processes are protected from OOM killer")
+        print("  Browsers will be killed first if system runs out of memory")
+
+    print("\nNote: These adjustments only affect currently running processes.")
+    print("New processes will use default OOM scores unless permanently configured.")
+    print("\nTo make this permanent, consider:")
+    print("  • Running this command at login (add to startup applications)")
+    print("  • Creating a systemd service to set OOM scores")
+    print("="*70)
+
+
 def main(args=None):
     """Main monitoring function."""
     # Handle special modes that exit early
@@ -802,12 +1454,28 @@ def main(args=None):
             analyze_dmesg_mode(args.analyze_dmesg)
             return
 
+        if args.analyze_oom is not None:
+            analyze_journalctl_oom(args.analyze_oom)
+            return
+
+        if args.show_oom_scores:
+            show_oom_scores()
+            return
+
+        if args.protect_session:
+            protect_session_processes()
+            return
+
         if args.check:
             check_memory_mode()
             return
 
         if args.list_browsers:
             list_browsers_mode()
+            return
+
+        if args.list_tabs:
+            list_tabs_mode()
             return
 
     # Load configuration
@@ -866,34 +1534,71 @@ def main(args=None):
                     f"{tree['total_memory_mb']:.1f} MB "
                     f"({len(tree['children'])} processes)")
 
-    # Find the browser instance with highest memory usage
-    target_pid, target_tree = max(browser_trees.items(),
-                                   key=lambda x: x[1]['total_memory_mb'])
-
-    logger.warning(f"Targeting {target_tree['browser_type'].upper()} "
-                   f"(PID {target_pid}) using {target_tree['total_memory_mb']:.1f} MB")
-
-    # Kill the browser
+    # Determine kill strategy
+    kill_mode = config.get('kill_mode', 'browser').lower()
     dry_run = config.get('dry_run', False)
+
     if dry_run:
-        logger.info("DRY RUN MODE - Would kill browser but not actually doing it")
+        logger.info("DRY RUN MODE - Will simulate actions without actually killing processes")
 
-    kill_result = kill_browser_instance(
-        target_tree,
-        config.get('kill_timeout_seconds', 30),
-        dry_run=dry_run
-    )
+    # Strategy B: Kill tabs first
+    if kill_mode == 'tab':
+        logger.info("Using STRATEGY B: Tab-level killing")
+        tabs_killed = kill_tabs_strategy(browser_trees, config, logger, current_username)
 
-    if kill_result['success']:
-        logger.info(f"Successfully terminated {kill_result['browser_type'].upper()} "
-                    f"(PID {kill_result['root_pid']}) using method: {kill_result['method']}")
-        logger.info(f"Freed approximately {kill_result['memory_freed_mb']:.1f} MB "
-                    f"across {kill_result['process_count']} processes")
+        if tabs_killed:
+            logger.info("Tab killing completed. Check memory on next cycle.")
+        else:
+            logger.warning("No eligible tabs to kill, falling back to killing entire browser")
+            # Fall back to killing entire browser
+            target_pid, target_tree = max(browser_trees.items(),
+                                           key=lambda x: x[1]['total_memory_mb'])
+
+            logger.warning(f"Targeting {target_tree['browser_type'].upper()} "
+                           f"(PID {target_pid}) using {target_tree['total_memory_mb']:.1f} MB")
+
+            kill_result = kill_browser_instance(
+                target_tree,
+                config.get('kill_timeout_seconds', 30),
+                dry_run=dry_run
+            )
+
+            if kill_result['success']:
+                logger.info(f"Successfully terminated {kill_result['browser_type'].upper()} "
+                            f"(PID {kill_result['root_pid']}) using method: {kill_result['method']}")
+                logger.info(f"Freed approximately {kill_result['memory_freed_mb']:.1f} MB "
+                            f"across {kill_result['process_count']} processes")
+            else:
+                logger.error(f"Failed to kill {kill_result['browser_type'].upper()} "
+                             f"(PID {kill_result['root_pid']})")
+                if 'error' in kill_result:
+                    logger.error(f"Error: {kill_result['error']}")
+
+    # Original strategy: Kill entire browser
     else:
-        logger.error(f"Failed to kill {kill_result['browser_type'].upper()} "
-                     f"(PID {kill_result['root_pid']})")
-        if 'error' in kill_result:
-            logger.error(f"Error: {kill_result['error']}")
+        logger.info("Using ORIGINAL STRATEGY: Entire browser killing")
+        target_pid, target_tree = max(browser_trees.items(),
+                                       key=lambda x: x[1]['total_memory_mb'])
+
+        logger.warning(f"Targeting {target_tree['browser_type'].upper()} "
+                       f"(PID {target_pid}) using {target_tree['total_memory_mb']:.1f} MB")
+
+        kill_result = kill_browser_instance(
+            target_tree,
+            config.get('kill_timeout_seconds', 30),
+            dry_run=dry_run
+        )
+
+        if kill_result['success']:
+            logger.info(f"Successfully terminated {kill_result['browser_type'].upper()} "
+                        f"(PID {kill_result['root_pid']}) using method: {kill_result['method']}")
+            logger.info(f"Freed approximately {kill_result['memory_freed_mb']:.1f} MB "
+                        f"across {kill_result['process_count']} processes")
+        else:
+            logger.error(f"Failed to kill {kill_result['browser_type'].upper()} "
+                         f"(PID {kill_result['root_pid']})")
+            if 'error' in kill_result:
+                logger.error(f"Error: {kill_result['error']}")
 
     logger.info("OOM Tracker finished")
     logger.info("="*60)

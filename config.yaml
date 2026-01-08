@@ -14,3 +14,16 @@ log_backup_count: 5  # Keep 5 backup log files
 
 # Dry run mode - if true, will only log what it would do without actually killing processes
 dry_run: false
+
+# Tab killing configuration (Strategy B)
+# Kill mode: "browser" kills entire browser instance, "tab" kills individual tabs first
+kill_mode: tab  # "tab" or "browser"
+
+# Only kill tabs using more than this amount of memory (MB)
+tab_memory_threshold_mb: 300
+
+# Maximum number of tabs to kill before falling back to killing entire browser
+max_tabs_to_kill: 3
+
+# Wait time between killing tabs (seconds)
+tab_kill_interval_seconds: 5

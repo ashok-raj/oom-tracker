@@ -187,7 +187,98 @@ python3 ~/Utils/oom-tracker/memory_monitor.py --list-browsers
 - Top processes within each browser tree
 - Total browser memory usage
 
-### Analyze OOM Events in Logs
+### Analyze System OOM Events (NEW in v1.3.0)
+
+Analyze system logs (journalctl) for OOM events with detailed root cause analysis:
+
+```bash
+# Analyze OOM events from the last 7 days (default)
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-oom
+
+# Analyze OOM events from the last 3 days
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-oom 3
+
+# Analyze just today
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-oom 1
+```
+
+**This command provides:**
+- Timeline of all OOM events with timestamps
+- Processes that were killed and memory freed
+- Top memory consumers at the time of each OOM
+- Root cause analysis identifying consistent memory hogs
+- Specific recommendations (detects if session processes were killed)
+- Warning if critical processes like gnome-shell or nautilus were killed
+
+**Example output:**
+```
+======================================================================
+SYSTEM OOM ANALYSIS - LAST 7 DAYS
+======================================================================
+
+⚠ Found 3 OOM event(s)
+
+TIMELINE OF OOM EVENTS
+----------------------------------------------------------------------
+
+1. Jan 07 03:19:32
+   Killed: chrome (PID 892044) - Freed 384.8 MB
+   Triggered by: gnome-shell (PID 720678)
+
+2. Jan 07 03:42:36
+   Killed: dropbox (PID 721105) - Freed 183.7 MB
+
+3. Jan 07 03:48:50
+   Killed: nautilus (PID 893201) - Freed 135.1 MB
+   ⚠  CAUSED LOGOUT - Session process killed!
+
+======================================================================
+MOST RECENT OOM EVENT - DETAILED ANALYSIS
+======================================================================
+
+[Detailed breakdown of the most recent OOM event]
+
+======================================================================
+RECOMMENDATIONS
+======================================================================
+
+⚠  CRITICAL: Session processes were killed, causing logout!
+   To prevent future logouts:
+   1. Run: python3 memory_monitor.py --protect-session
+   2. Enable OOM tracker to kill browsers proactively
+```
+
+### Protect Session Processes (NEW in v1.3.0)
+
+Configure OOM scores to protect critical session processes and prevent logouts:
+
+```bash
+# Run with sudo to protect all session processes
+sudo python3 ~/Utils/oom-tracker/memory_monitor.py --protect-session
+```
+
+**What this does:**
+- Sets negative OOM scores for critical processes (gnome-shell, gnome-session, systemd, dbus-daemon, nautilus)
+- Sets high OOM scores (300) for browsers to make them preferred targets
+- Prevents the kernel from killing session processes, which would cause logout
+- Only affects currently running processes
+
+**Note:** This must be run with sudo to modify system and user session processes.
+
+### Show OOM Scores (NEW in v1.3.0)
+
+View OOM scores for all running processes to understand OOM kill priority:
+
+```bash
+python3 ~/Utils/oom-tracker/memory_monitor.py --show-oom-scores
+```
+
+**Output includes:**
+- Top 20 processes most likely to be killed by OOM killer
+- List of protected processes (negative scores)
+- OOM score guide explaining what each score means
+
+### Analyze OOM Events in Dmesg Logs (v1.1.0)
 
 Analyze gzipped or plain text dmesg logs to find historical OOM killer events:
 
@@ -298,7 +389,13 @@ These commands are simpler alternatives to using `systemctl` and `journalctl` di
 | `--version` | Show version number |
 | `--check` | Check memory status and exit (no action taken) |
 | `--list-browsers` | List all browser instances and exit |
-| `--analyze-dmesg PATH` | Analyze dmesg log for OOM events |
+| **OOM Analysis (NEW v1.3.0)** | |
+| `--analyze-oom [DAYS]` | Analyze journalctl for OOM events (default: 7 days) |
+| `--show-oom-scores` | Show OOM scores for all running processes |
+| `--protect-session` | Protect critical session processes from OOM killer (needs sudo) |
+| **Legacy Analysis** | |
+| `--analyze-dmesg PATH` | Analyze dmesg log file for OOM events |
+| **Configuration** | |
 | `--dry-run` | Test mode - log actions without killing processes |
 | `--threshold N` | Override memory threshold (0-100) |
 | `--config PATH` | Use alternate configuration file |
@@ -513,7 +610,23 @@ systemctl --user daemon-reload
 
 ## Version History
 
-### Version 1.2.0 (Current)
+### Version 1.3.0 (Current)
+- **NEW**: Added `--analyze-oom [DAYS]` to analyze journalctl logs for OOM events with detailed timeline
+  - Automatically queries system logs and provides root cause analysis
+  - Detects if session processes were killed (causing logout)
+  - Shows timeline of all OOM events with memory freed
+  - Provides specific recommendations based on what was killed
+- **NEW**: Added `--show-oom-scores` to view OOM scores for all running processes
+  - Shows which processes are most/least likely to be killed by OOM
+  - Identifies already-protected processes
+- **NEW**: Added `--protect-session` to configure OOM score adjustments
+  - Protects critical session processes (gnome-shell, gnome-session, systemd, etc.) from OOM killer
+  - Increases OOM score for browsers to make them preferred targets
+  - Run with sudo to protect all user session processes
+- Enhanced root cause analysis across all analysis modes
+- Better error handling and permission checking
+
+### Version 1.2.0
 - Added built-in service management commands
 - Added `--enable-service` to enable and start systemd timer
 - Added `--disable-service` to disable and stop systemd timer
