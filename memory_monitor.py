@@ -220,6 +220,7 @@ def setup_logging(config):
 def get_memory_usage():
     """Get current memory usage percentage."""
     mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
     # Calculate based on available memory
     # This accounts for buffers/cache that can be reclaimed
     usage_percent = 100.0 - (mem.available / mem.total * 100.0)
@@ -227,7 +228,10 @@ def get_memory_usage():
         'total_gb': mem.total / (1024**3),
         'available_gb': mem.available / (1024**3),
         'used_gb': mem.used / (1024**3),
-        'percent': usage_percent
+        'percent': usage_percent,
+        'swap_total_gb': swap.total / (1024**3),
+        'swap_used_gb': swap.used / (1024**3),
+        'swap_percent': swap.percent
     }
 
 
@@ -872,6 +876,10 @@ def check_memory_mode():
     print(f"  Used:      {mem_usage['used_gb']:.2f} GB")
     print(f"  Available: {mem_usage['available_gb']:.2f} GB")
 
+    print(f"\nSwap Usage: {mem_usage['swap_percent']:.1f}%")
+    print(f"  Total:     {mem_usage['swap_total_gb']:.2f} GB")
+    print(f"  Used:      {mem_usage['swap_used_gb']:.2f} GB")
+
     # Get top memory consumers
     print(f"\nTop 5 Memory Consumers:")
     top_consumers = get_top_memory_consumers(5)
@@ -1029,11 +1037,47 @@ def list_tabs_mode():
     print("="*60)
 
 
+def get_recent_reboots(days=7):
+    """Get recent system reboots from last command."""
+    try:
+        result = subprocess.run(
+            ['last', 'reboot', '-s', f'-{days} days'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        reboots = []
+        for line in result.stdout.splitlines():
+            if 'system boot' in line.lower():
+                # Parse the line to extract timestamp
+                parts = line.split()
+                if len(parts) >= 5:
+                    # Format: "reboot system boot kernel Weekday Month Day HH:MM"
+                    month = parts[4]
+                    day = parts[5]
+                    time = parts[6]
+                    timestamp = f"{month} {day} {time}"
+                    reboots.append(timestamp)
+
+        return reboots
+    except Exception:
+        return []
+
+
 def analyze_journalctl_oom(days=7):
     """Analyze journalctl logs for OOM events with detailed timeline."""
     print("="*70)
     print(f"SYSTEM OOM ANALYSIS - LAST {days} DAYS")
     print("="*70)
+
+    # Get recent reboots
+    reboots = get_recent_reboots(days)
+    if reboots:
+        print(f"\nSystem Reboots in this period: {len(reboots)}")
+        for i, reboot in enumerate(reboots, 1):
+            print(f"  {i}. {reboot}")
+        print()
 
     try:
         # Query journalctl for OOM events
@@ -1237,14 +1281,26 @@ def analyze_journalctl_oom(days=7):
 
     # General recommendations
     total_mem_gb = psutil.virtual_memory().total / (1024**3)
+    swap = psutil.swap_memory()
+    swap_total_gb = swap.total / (1024**3)
+
     if total_mem_gb < 32:
         print(f"\n   Your system has {total_mem_gb:.0f}GB RAM. Consider:")
         print("   • Adding more physical RAM")
-        print("   • Increasing swap space")
+        if swap_total_gb < total_mem_gb * 0.5:
+            print(f"   • Increasing swap space (current: {swap_total_gb:.1f}GB, recommended: {total_mem_gb * 0.5:.1f}GB+)")
+        else:
+            print(f"   • Increasing swap space (current: {swap_total_gb:.1f}GB)")
 
     print("\n   Immediate actions:")
     print("   • Enable OOM tracker: python3 memory_monitor.py --enable-service")
     print("   • Monitor memory: python3 memory_monitor.py --check")
+
+    # Add note about correlation with reboots
+    if len(oom_events) > 0 and reboots:
+        print(f"\n   ⚠  Note: {len(oom_events)} OOM event(s) occurred, followed by {len(reboots)} reboot(s)")
+        print("   This suggests OOM events may have caused system instability")
+
     print("="*70)
 
 

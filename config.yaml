@@ -27,3 +27,8 @@ max_tabs_to_kill: 3
 
 # Wait time between killing tabs (seconds)
 tab_kill_interval_seconds: 5
+
+# Claude CLI monitoring (added for memory leak tracking)
+# Monitor Claude processes in addition to browsers
+monitor_claude: true
+claude_memory_threshold_mb: 10240  # Alert if Claude uses more than 10GB RSS
