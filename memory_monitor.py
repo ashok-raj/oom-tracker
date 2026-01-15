@@ -23,7 +23,7 @@ import signal
 
 
 # Configuration
-VERSION = '1.4.0'
+VERSION = '1.6.1'
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / 'config.yaml'
 LOG_DIR = SCRIPT_DIR / 'logs'
@@ -75,6 +75,13 @@ def setup_argparse():
         metavar='N',
         type=int,
         help='Memory threshold percentage 0-100 (overrides config)'
+    )
+
+    parser.add_argument(
+        '--swap-threshold',
+        metavar='N',
+        type=int,
+        help='Swap threshold percentage 0-100 (overrides config)'
     )
 
     parser.add_argument(
@@ -162,6 +169,11 @@ def setup_argparse():
         if args.threshold < 0 or args.threshold > 100:
             parser.error('--threshold must be between 0 and 100')
 
+    # Validate swap threshold if provided
+    if args.swap_threshold is not None:
+        if args.swap_threshold < 0 or args.swap_threshold > 100:
+            parser.error('--swap-threshold must be between 0 and 100')
+
     return args
 
 
@@ -235,22 +247,104 @@ def get_memory_usage():
     }
 
 
-def get_top_memory_consumers(limit=5):
-    """Get top N memory-consuming processes."""
+def get_process_swap(pid):
+    """Get swap usage for a process from /proc/[pid]/status."""
+    try:
+        with open(f'/proc/{pid}/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmSwap:'):
+                    # Format: "VmSwap:    1234 kB"
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) / 1024  # Convert kB to MB
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+    return 0.0
+
+
+def get_process_details(pid):
+    """Get detailed process info similar to 'ps p <pid>' output."""
+    try:
+        proc = psutil.Process(pid)
+
+        # Get process info
+        with proc.oneshot():
+            create_time = datetime.fromtimestamp(proc.create_time())
+            elapsed = datetime.now() - create_time
+
+            # Format elapsed time like ps (days-HH:MM:SS or HH:MM:SS)
+            total_seconds = int(elapsed.total_seconds())
+            days = total_seconds // 86400
+            hours = (total_seconds % 86400) // 3600
+            minutes = (total_seconds % 3600) // 60
+            seconds = total_seconds % 60
+
+            if days > 0:
+                elapsed_str = f"{days}-{hours:02d}:{minutes:02d}:{seconds:02d}"
+            else:
+                elapsed_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+            # Get CPU and memory percent
+            cpu_percent = proc.cpu_percent(interval=0.1)
+            mem_percent = proc.memory_percent()
+
+            # Get status
+            status = proc.status()
+
+            # Get command line (truncate if too long)
+            try:
+                cmdline = proc.cmdline()
+                cmd_str = ' '.join(cmdline) if cmdline else proc.name()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                cmd_str = proc.name()
+
+            return {
+                'pid': pid,
+                'user': proc.username(),
+                'cpu_percent': cpu_percent,
+                'mem_percent': mem_percent,
+                'status': status,
+                'elapsed': elapsed_str,
+                'start_time': create_time.strftime('%Y-%m-%d %H:%M'),
+                'command': cmd_str
+            }
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+        return None
+
+
+def get_top_memory_consumers(limit=10, sort_by='memory'):
+    """Get top N memory-consuming processes with swap usage.
+
+    Args:
+        limit: Number of processes to return
+        sort_by: 'memory', 'swap', or 'total' (memory + swap)
+    """
     processes = []
     for proc in psutil.process_iter(['pid', 'name', 'username', 'memory_info']):
         try:
             info = proc.info
+            memory_mb = info['memory_info'].rss / (1024**2)
+            swap_mb = get_process_swap(info['pid'])
+
             processes.append({
                 'pid': info['pid'],
                 'name': info['name'],
                 'username': info['username'],
-                'memory_mb': info['memory_info'].rss / (1024**2)
+                'memory_mb': memory_mb,
+                'swap_mb': swap_mb,
+                'total_mb': memory_mb + swap_mb
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    processes.sort(key=lambda x: x['memory_mb'], reverse=True)
+    # Sort by specified field
+    sort_key = {
+        'memory': lambda x: x['memory_mb'],
+        'swap': lambda x: x['swap_mb'],
+        'total': lambda x: x['total_mb']
+    }.get(sort_by, lambda x: x['memory_mb'])
+
+    processes.sort(key=sort_key, reverse=True)
     return processes[:limit]
 
 
@@ -865,9 +959,9 @@ def show_logs(follow=False):
 
 def check_memory_mode():
     """Check memory status and display information without taking action."""
-    print("="*60)
+    print("="*70)
     print("MEMORY STATUS CHECK")
-    print("="*60)
+    print("="*70)
 
     # Get memory usage
     mem_usage = get_memory_usage()
@@ -880,25 +974,113 @@ def check_memory_mode():
     print(f"  Total:     {mem_usage['swap_total_gb']:.2f} GB")
     print(f"  Used:      {mem_usage['swap_used_gb']:.2f} GB")
 
-    # Get top memory consumers
-    print(f"\nTop 5 Memory Consumers:")
-    top_consumers = get_top_memory_consumers(5)
-    for i, proc in enumerate(top_consumers, 1):
-        print(f"  {i}. PID {proc['pid']:>6}: {proc['name']:<20} "
-              f"({proc['username']:<10}) - {proc['memory_mb']:>8.1f} MB")
-
-    # Check against threshold
+    # Load config for thresholds
     config = load_config()
-    threshold = config.get('memory_threshold_percent', 90)
-    print(f"\nConfigured Threshold: {threshold}%")
+    mem_threshold = config.get('memory_threshold_percent', 90)
+    swap_threshold = config.get('swap_threshold_percent', 50)
 
-    if mem_usage['percent'] >= threshold:
-        print(f"STATUS: EXCEEDS threshold by {mem_usage['percent'] - threshold:.1f}%")
-        print("        (Monitor would take action if running normally)")
+    # Get top consumers (increased to 10 by default)
+    top_consumers = get_top_memory_consumers(10, sort_by='total')
+
+    # Show top memory consumers
+    print(f"\nTop 10 Memory Consumers (by RAM):")
+    print(f"  {'#':<3} {'PID':<8} {'Process':<20} {'User':<12} {'RAM':>10} {'Swap':>10} {'Total':>10}")
+    print(f"  {'-'*3} {'-'*8} {'-'*20} {'-'*12} {'-'*10} {'-'*10} {'-'*10}")
+
+    # Sort by memory for this display
+    by_memory = sorted(top_consumers, key=lambda x: x['memory_mb'], reverse=True)
+    for i, proc in enumerate(by_memory, 1):
+        print(f"  {i:<3} {proc['pid']:<8} {proc['name']:<20} {proc['username']:<12} "
+              f"{proc['memory_mb']:>9.1f}M {proc['swap_mb']:>9.1f}M {proc['total_mb']:>9.1f}M")
+
+    # Show top swap consumers if there's significant swap usage
+    swap_consumers = [p for p in top_consumers if p['swap_mb'] > 1]
+    if swap_consumers:
+        print(f"\nTop Swap Consumers:")
+        print(f"  {'#':<3} {'PID':<8} {'Process':<20} {'User':<12} {'Swap':>10} {'RAM':>10}")
+        print(f"  {'-'*3} {'-'*8} {'-'*20} {'-'*12} {'-'*10} {'-'*10}")
+
+        by_swap = sorted(swap_consumers, key=lambda x: x['swap_mb'], reverse=True)[:10]
+        for i, proc in enumerate(by_swap, 1):
+            print(f"  {i:<3} {proc['pid']:<8} {proc['name']:<20} {proc['username']:<12} "
+                  f"{proc['swap_mb']:>9.1f}M {proc['memory_mb']:>9.1f}M")
+
+        # Show detailed process info for top 5 swap consumers
+        print(f"\nTop Swap Consumers - Process Details (ps-style):")
+        print(f"  {'PID':<8} {'USER':<12} {'%CPU':>6} {'%MEM':>6} {'RSS':>10} {'SWAP':>10} {'STAT':<8} {'ELAPSED':>15} {'STARTED':<16}")
+        print(f"  {'-'*8} {'-'*12} {'-'*6} {'-'*6} {'-'*10} {'-'*10} {'-'*8} {'-'*15} {'-'*16}")
+
+        for proc in by_swap[:5]:
+            details = get_process_details(proc['pid'])
+            if details:
+                print(f"  {details['pid']:<8} {details['user']:<12} {details['cpu_percent']:>5.1f}% "
+                      f"{details['mem_percent']:>5.1f}% {proc['memory_mb']:>9.1f}M {proc['swap_mb']:>9.1f}M "
+                      f"{details['status']:<8} {details['elapsed']:>15} {details['start_time']:<16}")
+
+        # Show command lines for top 5 swap consumers
+        print(f"\n  Command lines:")
+        for proc in by_swap[:5]:
+            details = get_process_details(proc['pid'])
+            if details:
+                cmd = details['command']
+                # Truncate long commands
+                if len(cmd) > 100:
+                    cmd = cmd[:97] + "..."
+                print(f"  [{proc['pid']}] {cmd}")
     else:
-        print(f"STATUS: Below threshold by {threshold - mem_usage['percent']:.1f}%")
+        print(f"\nNo significant swap usage detected.")
 
-    print("="*60)
+    # Always show process details for top memory consumers
+    print(f"\nTop Memory Consumers - Process Details (ps-style):")
+    print(f"  {'PID':<8} {'USER':<12} {'%CPU':>6} {'%MEM':>6} {'RSS':>10} {'SWAP':>10} {'STAT':<8} {'ELAPSED':>15} {'STARTED':<16}")
+    print(f"  {'-'*8} {'-'*12} {'-'*6} {'-'*6} {'-'*10} {'-'*10} {'-'*8} {'-'*15} {'-'*16}")
+
+    for proc in by_memory[:5]:
+        details = get_process_details(proc['pid'])
+        if details:
+            print(f"  {details['pid']:<8} {details['user']:<12} {details['cpu_percent']:>5.1f}% "
+                  f"{details['mem_percent']:>5.1f}% {proc['memory_mb']:>9.1f}M {proc['swap_mb']:>9.1f}M "
+                  f"{details['status']:<8} {details['elapsed']:>15} {details['start_time']:<16}")
+
+    # Show command lines for top 5 memory consumers
+    print(f"\n  Command lines:")
+    for proc in by_memory[:5]:
+        details = get_process_details(proc['pid'])
+        if details:
+            cmd = details['command']
+            # Truncate long commands
+            if len(cmd) > 100:
+                cmd = cmd[:97] + "..."
+            print(f"  [{proc['pid']}] {cmd}")
+
+    # Check against thresholds
+    print(f"\n{'='*70}")
+    print("THRESHOLD STATUS")
+    print(f"{'='*70}")
+    print(f"\nConfigured Thresholds:")
+    print(f"  Memory: {mem_threshold}%")
+    print(f"  Swap:   {swap_threshold}%")
+
+    mem_exceeded = mem_usage['percent'] >= mem_threshold
+    swap_exceeded = mem_usage['swap_percent'] >= swap_threshold
+
+    print(f"\nCurrent Status:")
+    if mem_exceeded:
+        print(f"  ⚠  MEMORY EXCEEDS threshold by {mem_usage['percent'] - mem_threshold:.1f}%")
+    else:
+        print(f"  ✓  Memory below threshold by {mem_threshold - mem_usage['percent']:.1f}%")
+
+    if swap_exceeded:
+        print(f"  ⚠  SWAP EXCEEDS threshold by {mem_usage['swap_percent'] - swap_threshold:.1f}%")
+    else:
+        print(f"  ✓  Swap below threshold by {swap_threshold - mem_usage['swap_percent']:.1f}%")
+
+    if mem_exceeded or swap_exceeded:
+        print(f"\n  → Monitor would TAKE ACTION if running normally")
+    else:
+        print(f"\n  → No action needed")
+
+    print("="*70)
 
 
 def list_browsers_mode():
@@ -1544,6 +1726,8 @@ def main(args=None):
             config['dry_run'] = True
         if args.threshold is not None:
             config['memory_threshold_percent'] = args.threshold
+        if args.swap_threshold is not None:
+            config['swap_threshold_percent'] = args.swap_threshold
 
     logger = setup_logging(config)
 
@@ -1554,26 +1738,40 @@ def main(args=None):
     current_username = psutil.Process().username()
     logger.info(f"Monitoring processes for user: {current_username}")
 
-    # Check memory usage
+    # Check memory and swap usage
     mem_usage = get_memory_usage()
     logger.info(f"Memory usage: {mem_usage['percent']:.1f}% "
                 f"(Available: {mem_usage['available_gb']:.1f}GB / "
                 f"Total: {mem_usage['total_gb']:.1f}GB)")
+    logger.info(f"Swap usage: {mem_usage['swap_percent']:.1f}% "
+                f"(Used: {mem_usage['swap_used_gb']:.1f}GB / "
+                f"Total: {mem_usage['swap_total_gb']:.1f}GB)")
 
-    threshold = config.get('memory_threshold_percent', 90)
+    mem_threshold = config.get('memory_threshold_percent', 90)
+    swap_threshold = config.get('swap_threshold_percent', 50)
 
-    if mem_usage['percent'] < threshold:
-        logger.info(f"Memory usage below threshold ({threshold}%). No action needed.")
+    mem_exceeded = mem_usage['percent'] >= mem_threshold
+    swap_exceeded = mem_usage['swap_percent'] >= swap_threshold
+
+    if not mem_exceeded and not swap_exceeded:
+        logger.info(f"Memory ({mem_usage['percent']:.1f}%) below threshold ({mem_threshold}%), "
+                    f"Swap ({mem_usage['swap_percent']:.1f}%) below threshold ({swap_threshold}%). "
+                    f"No action needed.")
         return
 
-    logger.warning(f"Memory usage EXCEEDS threshold ({threshold}%)!")
+    # Log which threshold(s) exceeded
+    if mem_exceeded:
+        logger.warning(f"Memory usage EXCEEDS threshold ({mem_threshold}%)!")
+    if swap_exceeded:
+        logger.warning(f"Swap usage EXCEEDS threshold ({swap_threshold}%)!")
 
-    # Log top memory consumers
-    top_consumers = get_top_memory_consumers(5)
-    logger.info("Top 5 memory consumers:")
+    # Log top memory and swap consumers
+    top_consumers = get_top_memory_consumers(10, sort_by='total')
+    logger.info("Top 10 memory/swap consumers:")
     for i, proc in enumerate(top_consumers, 1):
         logger.info(f"  {i}. PID {proc['pid']}: {proc['name']} "
-                    f"({proc['username']}) - {proc['memory_mb']:.1f} MB")
+                    f"({proc['username']}) - RAM: {proc['memory_mb']:.1f}MB, "
+                    f"Swap: {proc['swap_mb']:.1f}MB, Total: {proc['total_mb']:.1f}MB")
 
     # Find browser process trees
     browser_trees = find_browser_process_tree(current_username)

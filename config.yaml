@@ -4,6 +4,11 @@
 # When system memory usage exceeds this threshold, the tool will kill browsers
 memory_threshold_percent: 90
 
+# Swap threshold percentage (0-100)
+# When swap usage exceeds this threshold, the tool will also trigger action
+# This helps catch memory pressure before the system becomes unresponsive
+swap_threshold_percent: 50
+
 # How long to wait after sending SIGTERM before sending SIGKILL (seconds)
 kill_timeout_seconds: 30
 
