@@ -23,11 +23,12 @@ import signal
 
 
 # Configuration
-VERSION = '1.6.1'
+VERSION = '1.7.0'
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / 'config.yaml'
 LOG_DIR = SCRIPT_DIR / 'logs'
 LOG_FILE = LOG_DIR / 'memory-monitor.log'
+SNAPSHOT_FILE = LOG_DIR / 'memory-snapshots.jsonl'
 
 # Browser detection patterns
 BROWSER_PATTERNS = {
@@ -119,6 +120,35 @@ def setup_argparse():
     )
 
     parser.add_argument(
+        '--snapshot',
+        action='store_true',
+        help='Start continuous memory snapshot logging (run as daemon to track OOM causes)'
+    )
+
+    parser.add_argument(
+        '--snapshot-interval',
+        metavar='SECS',
+        type=int,
+        default=30,
+        help='Interval between snapshots in seconds (default: 30)'
+    )
+
+    parser.add_argument(
+        '--analyze-snapshots',
+        metavar='MINUTES',
+        type=int,
+        nargs='?',
+        const=60,
+        help='Analyze memory snapshots from past N minutes to find memory hogs (default: 60)'
+    )
+
+    parser.add_argument(
+        '--correlate-oom',
+        action='store_true',
+        help='Correlate recent OOM events with memory snapshots to identify true culprits'
+    )
+
+    parser.add_argument(
         '--protect-session',
         action='store_true',
         help='Configure OOM score adjustments to protect critical session processes'
@@ -160,6 +190,24 @@ def setup_argparse():
         '--follow-logs',
         action='store_true',
         help='Follow logs in real-time (use with --logs or alone)'
+    )
+
+    service_group.add_argument(
+        '--enable-snapshot-daemon',
+        action='store_true',
+        help='Enable continuous memory snapshot logging as a systemd user service'
+    )
+
+    service_group.add_argument(
+        '--disable-snapshot-daemon',
+        action='store_true',
+        help='Disable the memory snapshot logging service'
+    )
+
+    service_group.add_argument(
+        '--snapshot-status',
+        action='store_true',
+        help='Show status of the memory snapshot daemon'
     )
 
     args = parser.parse_args()
@@ -931,6 +979,131 @@ def service_status():
         sys.exit(1)
 
 
+def enable_snapshot_daemon():
+    """Enable the memory snapshot daemon as a systemd user service."""
+    print("Enabling OOM Tracker Snapshot Daemon...")
+    print()
+
+    service_file = SCRIPT_DIR / 'oom-tracker-snapshot.service'
+    user_service_dir = Path.home() / '.config' / 'systemd' / 'user'
+
+    try:
+        # Create user systemd directory if it doesn't exist
+        user_service_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy service file
+        dest_file = user_service_dir / 'oom-tracker-snapshot.service'
+
+        # Read and update the service file with correct path
+        with open(service_file, 'r') as f:
+            service_content = f.read()
+
+        # Replace the path placeholder with actual path
+        service_content = service_content.replace(
+            '%h/work/Utils/oom-tracker/memory_monitor.py',
+            str(SCRIPT_DIR / 'memory_monitor.py')
+        )
+
+        with open(dest_file, 'w') as f:
+            f.write(service_content)
+
+        print(f"Installed service file to: {dest_file}")
+
+        # Reload systemd
+        subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
+
+        # Enable and start the service
+        result = subprocess.run(
+            ['systemctl', '--user', 'enable', '--now', 'oom-tracker-snapshot.service'],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print("✓ Snapshot daemon enabled and started")
+            print()
+            print("Memory snapshots are now being logged continuously.")
+            print(f"Snapshots saved to: {SNAPSHOT_FILE}")
+            print()
+            print("Useful commands:")
+            print("  Check status:     python3 memory_monitor.py --snapshot-status")
+            print("  Analyze:          python3 memory_monitor.py --analyze-snapshots")
+            print("  Correlate OOM:    python3 memory_monitor.py --correlate-oom")
+            print("  View logs:        journalctl --user -u oom-tracker-snapshot -f")
+        else:
+            print(f"✗ Failed to enable service: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def disable_snapshot_daemon():
+    """Disable the memory snapshot daemon."""
+    print("Disabling OOM Tracker Snapshot Daemon...")
+
+    try:
+        result = subprocess.run(
+            ['systemctl', '--user', 'disable', '--now', 'oom-tracker-snapshot.service'],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print("✓ Snapshot daemon disabled and stopped")
+        else:
+            print(f"Note: {result.stderr.strip()}")
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def snapshot_daemon_status():
+    """Show status of the memory snapshot daemon."""
+    print("="*60)
+    print("OOM TRACKER SNAPSHOT DAEMON STATUS")
+    print("="*60)
+    print()
+
+    try:
+        # Check service status
+        subprocess.run(
+            ['systemctl', '--user', 'status', 'oom-tracker-snapshot.service', '--no-pager'],
+            check=False
+        )
+
+        # Show snapshot file info
+        print()
+        print("-"*60)
+        if SNAPSHOT_FILE.exists():
+            size_mb = SNAPSHOT_FILE.stat().st_size / (1024**2)
+            # Count lines (snapshots)
+            with open(SNAPSHOT_FILE, 'r') as f:
+                snapshot_count = sum(1 for _ in f)
+            print(f"Snapshot file: {SNAPSHOT_FILE}")
+            print(f"  Size: {size_mb:.2f} MB")
+            print(f"  Snapshots: {snapshot_count}")
+
+            # Show most recent snapshot
+            with open(SNAPSHOT_FILE, 'r') as f:
+                lines = f.readlines()
+                if lines:
+                    last_snap = json.loads(lines[-1])
+                    print(f"  Last snapshot: {last_snap['timestamp']}")
+        else:
+            print(f"Snapshot file not found: {SNAPSHOT_FILE}")
+            print("Snapshot daemon may not be running.")
+
+    except FileNotFoundError:
+        print("Error: systemctl not found", file=sys.stderr)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+
+    print("="*60)
+
+
 def show_logs(follow=False):
     """Show logs from the systemd service."""
     try:
@@ -1262,10 +1435,10 @@ def analyze_journalctl_oom(days=7):
         print()
 
     try:
-        # Query journalctl for OOM events
+        # Query journalctl for OOM events with ISO timestamps for precision
         since_date = datetime.now().timestamp() - (days * 86400)
         result = subprocess.run(
-            ['journalctl', '-k', '--since', f'{days} days ago', '--no-pager'],
+            ['journalctl', '-k', '--since', f'{days} days ago', '--no-pager', '-o', 'short-iso'],
             capture_output=True,
             text=True,
             timeout=30
@@ -1289,6 +1462,8 @@ def analyze_journalctl_oom(days=7):
     current_event = None
     task_list_processes = []
 
+    # Support both ISO and traditional timestamp formats
+    timestamp_iso_re = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})')
     timestamp_re = re.compile(r'^(\w+\s+\d+\s+\d+:\d+:\d+)')
     oom_killer_re = re.compile(r'invoked oom-killer')
     trigger_process_re = re.compile(r'CPU:\s+\d+\s+PID:\s+(\d+)\s+Comm:\s+(\S+)')
@@ -1297,9 +1472,19 @@ def analyze_journalctl_oom(days=7):
     task_entry_re = re.compile(r'\[\s*(\d+)\]\s+\d+\s+\d+\s+(\d+)\s+(\d+).*?\s+\d+\s+(\S+)\s*$')
 
     for line in lines:
-        # Extract timestamp
-        ts_match = timestamp_re.match(line)
-        timestamp = ts_match.group(1) if ts_match else None
+        # Extract timestamp (prefer ISO format for precision)
+        ts_match = timestamp_iso_re.match(line)
+        if ts_match:
+            timestamp = ts_match.group(1)
+            try:
+                timestamp_dt = datetime.fromisoformat(timestamp.replace('+', '+'))
+                timestamp_epoch = timestamp_dt.timestamp()
+            except ValueError:
+                timestamp_epoch = None
+        else:
+            ts_match = timestamp_re.match(line)
+            timestamp = ts_match.group(1) if ts_match else None
+            timestamp_epoch = None
 
         # Start of new OOM event
         if oom_killer_re.search(line):
@@ -1308,6 +1493,7 @@ def analyze_journalctl_oom(days=7):
 
             current_event = {
                 'timestamp': timestamp or 'unknown',
+                'timestamp_epoch': timestamp_epoch,
                 'trigger_process': None,
                 'trigger_pid': None,
                 'killed_process': None,
@@ -1483,6 +1669,15 @@ def analyze_journalctl_oom(days=7):
         print(f"\n   ⚠  Note: {len(oom_events)} OOM event(s) occurred, followed by {len(reboots)} reboot(s)")
         print("   This suggests OOM events may have caused system instability")
 
+    # Check for snapshot data
+    if SNAPSHOT_FILE.exists():
+        print(f"\n   💡 Memory snapshots available! Run for detailed analysis:")
+        print(f"      python3 memory_monitor.py --correlate-oom")
+    else:
+        print(f"\n   💡 To find the TRUE culprit behind OOM kills:")
+        print(f"      1. Start snapshot daemon: python3 memory_monitor.py --snapshot &")
+        print(f"      2. After next OOM, run: python3 memory_monitor.py --correlate-oom")
+
     print("="*70)
 
 
@@ -1547,6 +1742,381 @@ def show_oom_scores():
             print(f"{proc['pid']:<8} {proc['oom_score']:<10} {proc['oom_score_adj']:<6} "
                   f"{proc['username']:<12} {proc['name']:<30}")
 
+    print("="*70)
+
+
+def snapshot_memory_state():
+    """Capture a complete memory snapshot of all processes."""
+    timestamp = datetime.now()
+
+    # Get system memory
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+
+    # Get all processes with memory info
+    processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'username', 'memory_info', 'create_time']):
+        try:
+            info = proc.info
+            memory_mb = info['memory_info'].rss / (1024**2)
+            swap_mb = get_process_swap(info['pid'])
+
+            # Get oom_score
+            try:
+                with open(f'/proc/{info["pid"]}/oom_score', 'r') as f:
+                    oom_score = int(f.read().strip())
+            except (FileNotFoundError, PermissionError):
+                oom_score = -1
+
+            processes.append({
+                'pid': info['pid'],
+                'name': info['name'],
+                'username': info['username'],
+                'memory_mb': round(memory_mb, 1),
+                'swap_mb': round(swap_mb, 1),
+                'oom_score': oom_score,
+                'age_hours': round((timestamp.timestamp() - info['create_time']) / 3600, 2) if info['create_time'] else 0
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # Sort by memory (descending)
+    processes.sort(key=lambda x: x['memory_mb'], reverse=True)
+
+    snapshot = {
+        'timestamp': timestamp.isoformat(),
+        'timestamp_epoch': timestamp.timestamp(),
+        'system': {
+            'mem_percent': round(100 - (mem.available / mem.total * 100), 1),
+            'mem_available_gb': round(mem.available / (1024**3), 2),
+            'mem_total_gb': round(mem.total / (1024**3), 2),
+            'swap_percent': round(swap.percent, 1),
+            'swap_used_gb': round(swap.used / (1024**3), 2),
+            'swap_total_gb': round(swap.total / (1024**3), 2)
+        },
+        'top_processes': processes[:20]  # Keep top 20 memory consumers
+    }
+
+    return snapshot
+
+
+def run_snapshot_daemon(interval_seconds=30):
+    """Run continuous memory snapshot logging."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"OOM Tracker Memory Snapshot Daemon v{VERSION}")
+    print(f"Logging to: {SNAPSHOT_FILE}")
+    print(f"Interval: {interval_seconds} seconds")
+    print("Press Ctrl+C to stop")
+    print()
+
+    def signal_handler(sig, frame):
+        print("\n\nSnapshot daemon stopped.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    snapshot_count = 0
+
+    while True:
+        try:
+            snapshot = snapshot_memory_state()
+
+            # Write to JSONL file
+            with open(SNAPSHOT_FILE, 'a') as f:
+                f.write(json.dumps(snapshot) + '\n')
+
+            snapshot_count += 1
+
+            # Print status
+            sys_info = snapshot['system']
+            top_proc = snapshot['top_processes'][0] if snapshot['top_processes'] else None
+
+            status_line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            status_line += f"Mem: {sys_info['mem_percent']:.1f}% | "
+            status_line += f"Swap: {sys_info['swap_percent']:.1f}%"
+            if top_proc:
+                status_line += f" | Top: {top_proc['name'][:15]} ({top_proc['memory_mb']:.0f}MB)"
+            print(status_line)
+
+        except Exception as e:
+            print(f"Error capturing snapshot: {e}", file=sys.stderr)
+
+        time.sleep(interval_seconds)
+
+
+def analyze_snapshots_mode(minutes=60):
+    """Analyze recent memory snapshots to find memory hogs."""
+    print("="*70)
+    print(f"MEMORY SNAPSHOT ANALYSIS - LAST {minutes} MINUTES")
+    print("="*70)
+
+    if not SNAPSHOT_FILE.exists():
+        print(f"\nNo snapshot file found at: {SNAPSHOT_FILE}")
+        print("Run snapshot daemon first: python3 memory_monitor.py --snapshot")
+        return
+
+    cutoff_time = datetime.now().timestamp() - (minutes * 60)
+    snapshots = []
+
+    with open(SNAPSHOT_FILE, 'r') as f:
+        for line in f:
+            try:
+                snap = json.loads(line)
+                if snap.get('timestamp_epoch', 0) >= cutoff_time:
+                    snapshots.append(snap)
+            except json.JSONDecodeError:
+                continue
+
+    if not snapshots:
+        print(f"\nNo snapshots found in the last {minutes} minutes.")
+        print("Make sure the snapshot daemon is running.")
+        return
+
+    print(f"\nAnalyzed {len(snapshots)} snapshot(s)")
+    print(f"Time range: {snapshots[0]['timestamp']} to {snapshots[-1]['timestamp']}")
+
+    # Analyze memory pressure periods
+    high_pressure_snaps = [s for s in snapshots if s['system']['mem_percent'] >= 85]
+
+    if high_pressure_snaps:
+        print(f"\n⚠  Found {len(high_pressure_snaps)} high memory pressure periods (>=85%)")
+
+    # Track process memory over time
+    process_stats = {}
+    for snap in snapshots:
+        for proc in snap['top_processes']:
+            name = proc['name']
+            if name not in process_stats:
+                process_stats[name] = {
+                    'samples': [],
+                    'memory_mb': [],
+                    'swap_mb': [],
+                    'pids': set(),
+                    'max_oom_score': 0
+                }
+            process_stats[name]['samples'].append(snap['timestamp'])
+            process_stats[name]['memory_mb'].append(proc['memory_mb'])
+            process_stats[name]['swap_mb'].append(proc['swap_mb'])
+            process_stats[name]['pids'].add(proc['pid'])
+            process_stats[name]['max_oom_score'] = max(process_stats[name]['max_oom_score'], proc.get('oom_score', 0))
+
+    # Calculate stats for each process
+    proc_summary = []
+    for name, stats in process_stats.items():
+        if len(stats['memory_mb']) > 0:
+            proc_summary.append({
+                'name': name,
+                'avg_mb': sum(stats['memory_mb']) / len(stats['memory_mb']),
+                'max_mb': max(stats['memory_mb']),
+                'min_mb': min(stats['memory_mb']),
+                'avg_swap_mb': sum(stats['swap_mb']) / len(stats['swap_mb']),
+                'max_swap_mb': max(stats['swap_mb']),
+                'samples': len(stats['memory_mb']),
+                'total_samples': len(snapshots),
+                'pids': len(stats['pids']),
+                'max_oom_score': stats['max_oom_score'],
+                'growth_mb': stats['memory_mb'][-1] - stats['memory_mb'][0] if len(stats['memory_mb']) > 1 else 0
+            })
+
+    # Sort by average memory usage
+    proc_summary.sort(key=lambda x: x['avg_mb'], reverse=True)
+
+    print(f"\n{'='*70}")
+    print("TOP MEMORY CONSUMERS (by average)")
+    print(f"{'='*70}")
+    print(f"{'#':<3} {'Process':<20} {'Avg MB':>10} {'Max MB':>10} {'Swap MB':>10} {'OOM Score':>10} {'Growth':>10}")
+    print(f"{'-'*3} {'-'*20} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+
+    for i, p in enumerate(proc_summary[:15], 1):
+        growth_str = f"{p['growth_mb']:+.0f}" if p['growth_mb'] != 0 else "0"
+        print(f"{i:<3} {p['name']:<20} {p['avg_mb']:>10.1f} {p['max_mb']:>10.1f} "
+              f"{p['avg_swap_mb']:>10.1f} {p['max_oom_score']:>10} {growth_str:>10}")
+
+    # Find processes with memory growth (potential leaks)
+    growing_procs = [p for p in proc_summary if p['growth_mb'] > 100]
+    if growing_procs:
+        print(f"\n{'='*70}")
+        print("⚠  PROCESSES WITH SIGNIFICANT MEMORY GROWTH (>100MB)")
+        print(f"{'='*70}")
+        for p in sorted(growing_procs, key=lambda x: x['growth_mb'], reverse=True):
+            print(f"  {p['name']:<25} grew by {p['growth_mb']:+.0f} MB "
+                  f"({p['min_mb']:.0f} MB → {p['max_mb']:.0f} MB)")
+
+    # Show system memory trend
+    if len(snapshots) > 1:
+        first_mem = snapshots[0]['system']['mem_percent']
+        last_mem = snapshots[-1]['system']['mem_percent']
+        peak_mem = max(s['system']['mem_percent'] for s in snapshots)
+
+        print(f"\n{'='*70}")
+        print("SYSTEM MEMORY TREND")
+        print(f"{'='*70}")
+        print(f"  Start: {first_mem:.1f}%")
+        print(f"  End:   {last_mem:.1f}%")
+        print(f"  Peak:  {peak_mem:.1f}%")
+        print(f"  Trend: {last_mem - first_mem:+.1f}%")
+
+    # Identify likely OOM targets vs actual memory hogs
+    print(f"\n{'='*70}")
+    print("OOM KILLER PREDICTION")
+    print(f"{'='*70}")
+    print("\nProcesses most likely to be killed by OOM (high OOM score + big memory):")
+
+    # Sort by combination of OOM score and memory
+    oom_targets = sorted(proc_summary, key=lambda x: (x['max_oom_score'], x['avg_mb']), reverse=True)[:5]
+    for i, p in enumerate(oom_targets, 1):
+        print(f"  {i}. {p['name']:<20} OOM Score: {p['max_oom_score']:>4}, Avg: {p['avg_mb']:.0f} MB")
+
+    print("\nActual biggest memory consumers (what SHOULD be killed):")
+    for i, p in enumerate(proc_summary[:5], 1):
+        print(f"  {i}. {p['name']:<20} Avg: {p['avg_mb']:.0f} MB, OOM Score: {p['max_oom_score']}")
+
+    print("="*70)
+
+
+def correlate_oom_with_snapshots():
+    """Correlate OOM events with memory snapshots to identify true culprits."""
+    print("="*70)
+    print("OOM EVENT CORRELATION WITH MEMORY SNAPSHOTS")
+    print("="*70)
+
+    # First, get recent OOM events from journalctl
+    try:
+        result = subprocess.run(
+            ['journalctl', '-k', '--since', '7 days ago', '--no-pager', '-o', 'short-iso'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"Error querying journalctl: {result.stderr}", file=sys.stderr)
+            return
+
+        lines = result.stdout.splitlines()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return
+
+    # Parse OOM events with precise timestamps
+    oom_events = []
+    timestamp_re = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})')
+    killed_re = re.compile(r'Out of memory: Killed process (\d+) \(([^)]+)\)')
+
+    for line in lines:
+        killed_match = killed_re.search(line)
+        if killed_match:
+            ts_match = timestamp_re.match(line)
+            if ts_match:
+                try:
+                    # Parse ISO timestamp
+                    ts_str = ts_match.group(1)
+                    # Convert to datetime
+                    ts = datetime.fromisoformat(ts_str.replace('+', '+'))
+                    oom_events.append({
+                        'timestamp': ts,
+                        'timestamp_epoch': ts.timestamp(),
+                        'killed_pid': int(killed_match.group(1)),
+                        'killed_name': killed_match.group(2)
+                    })
+                except ValueError:
+                    pass
+
+    if not oom_events:
+        print("\nNo OOM events found in the last 7 days.")
+        return
+
+    print(f"\nFound {len(oom_events)} OOM event(s)")
+
+    # Load snapshots
+    if not SNAPSHOT_FILE.exists():
+        print(f"\nNo snapshot file found. Cannot correlate.")
+        print("Run snapshot daemon: python3 memory_monitor.py --snapshot")
+        return
+
+    snapshots = []
+    with open(SNAPSHOT_FILE, 'r') as f:
+        for line in f:
+            try:
+                snapshots.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    if not snapshots:
+        print("\nNo snapshots found in the log file.")
+        return
+
+    print(f"Loaded {len(snapshots)} memory snapshot(s)")
+
+    # Correlate each OOM event with nearest snapshot
+    for i, event in enumerate(oom_events, 1):
+        print(f"\n{'='*70}")
+        print(f"OOM EVENT #{i}")
+        print(f"{'='*70}")
+        print(f"Time:    {event['timestamp']}")
+        print(f"Killed:  {event['killed_name']} (PID {event['killed_pid']})")
+
+        # Find closest snapshot before the OOM event
+        closest_snap = None
+        min_diff = float('inf')
+
+        for snap in snapshots:
+            snap_time = snap.get('timestamp_epoch', 0)
+            diff = event['timestamp_epoch'] - snap_time
+
+            # Only consider snapshots before or at the OOM event (within 5 min)
+            if 0 <= diff < 300 and diff < min_diff:
+                min_diff = diff
+                closest_snap = snap
+
+        if closest_snap:
+            print(f"\nClosest snapshot: {closest_snap['timestamp']} ({min_diff:.0f}s before OOM)")
+            print(f"System state: Mem {closest_snap['system']['mem_percent']:.1f}%, "
+                  f"Swap {closest_snap['system']['swap_percent']:.1f}%")
+
+            print(f"\nActual memory consumers at time of OOM:")
+            print(f"{'#':<3} {'Process':<25} {'Memory MB':>12} {'Swap MB':>10} {'OOM Score':>10}")
+            print(f"{'-'*3} {'-'*25} {'-'*12} {'-'*10} {'-'*10}")
+
+            for j, proc in enumerate(closest_snap['top_processes'][:10], 1):
+                marker = "→" if proc['name'] == event['killed_name'] else " "
+                print(f"{marker}{j:<2} {proc['name']:<25} {proc['memory_mb']:>12.1f} "
+                      f"{proc['swap_mb']:>10.1f} {proc.get('oom_score', 'N/A'):>10}")
+
+            # Check if killed process was actually the biggest consumer
+            killed_proc = next((p for p in closest_snap['top_processes'] if p['name'] == event['killed_name']), None)
+            top_proc = closest_snap['top_processes'][0] if closest_snap['top_processes'] else None
+
+            print(f"\n--- ROOT CAUSE ANALYSIS ---")
+            if killed_proc and top_proc:
+                if killed_proc['name'] == top_proc['name']:
+                    print(f"✓ Correct: {event['killed_name']} was the top memory consumer")
+                else:
+                    killed_mem = killed_proc['memory_mb']
+                    top_mem = top_proc['memory_mb']
+                    print(f"⚠ MISMATCH: OOM killed {event['killed_name']} ({killed_mem:.0f} MB)")
+                    print(f"            But {top_proc['name']} was using {top_mem:.0f} MB")
+                    print(f"            → TRUE CULPRIT was likely {top_proc['name']}")
+            elif not killed_proc:
+                print(f"⚠ {event['killed_name']} wasn't even in top 20 memory consumers!")
+                print(f"  → TRUE CULPRIT was likely {top_proc['name']} ({top_proc['memory_mb']:.0f} MB)")
+        else:
+            print(f"\nNo snapshot found near this OOM event (within 5 minutes)")
+            print("Ensure snapshot daemon was running at the time.")
+
+    # Summary recommendations
+    print(f"\n{'='*70}")
+    print("RECOMMENDATIONS")
+    print(f"{'='*70}")
+    print("\n1. Keep the snapshot daemon running to capture memory state:")
+    print("   python3 memory_monitor.py --snapshot &")
+    print("\n2. To make it persistent, create a systemd service for snapshots")
+    print("\n3. When OOM occurs, run this correlation to find the true culprit:")
+    print("   python3 memory_monitor.py --correlate-oom")
+    print("\n4. Adjust OOM scores for problem processes:")
+    print("   echo 1000 | sudo tee /proc/<PID>/oom_score_adj")
     print("="*70)
 
 
@@ -1687,6 +2257,18 @@ def main(args=None):
             show_logs(follow=args.follow_logs)
             return
 
+        if args.enable_snapshot_daemon:
+            enable_snapshot_daemon()
+            return
+
+        if args.disable_snapshot_daemon:
+            disable_snapshot_daemon()
+            return
+
+        if args.snapshot_status:
+            snapshot_daemon_status()
+            return
+
         # Analysis and info modes
         if args.analyze_dmesg:
             analyze_dmesg_mode(args.analyze_dmesg)
@@ -1694,6 +2276,18 @@ def main(args=None):
 
         if args.analyze_oom is not None:
             analyze_journalctl_oom(args.analyze_oom)
+            return
+
+        if args.snapshot:
+            run_snapshot_daemon(args.snapshot_interval)
+            return
+
+        if args.analyze_snapshots is not None:
+            analyze_snapshots_mode(args.analyze_snapshots)
+            return
+
+        if args.correlate_oom:
+            correlate_oom_with_snapshots()
             return
 
         if args.show_oom_scores:

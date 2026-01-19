@@ -1,0 +1,18 @@
+[Unit]
+Description=OOM Tracker Memory Snapshot Daemon
+Documentation=https://github.com/araj/oom-tracker
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/work/Utils/oom-tracker/memory_monitor.py --snapshot --snapshot-interval 30
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oom-snapshot
+
+[Install]
+WantedBy=default.target

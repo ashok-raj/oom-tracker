@@ -8,6 +8,7 @@ Proactive memory monitoring tool that prevents system OOM (Out-Of-Memory) crashe
 - [Features](#features)
 - [Quick Start](#quick-start)
 - [Use Cases](#use-cases)
+- [Finding the True Root Cause of OOM Events](#finding-the-true-root-cause-of-oom-events)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
@@ -18,6 +19,7 @@ Proactive memory monitoring tool that prevents system OOM (Out-Of-Memory) crashe
   - [Check Memory Status](#check-memory-status)
   - [List Running Browsers](#list-running-browsers)
   - [Analyze OOM Events in Logs](#analyze-oom-events-in-logs)
+  - [Memory Snapshot Daemon](#memory-snapshot-daemon)
   - [Override Configuration Settings](#override-configuration-settings)
   - [All Available Options](#all-available-options)
 - [How It Works](#how-it-works)
@@ -45,10 +47,19 @@ Your system was experiencing overnight logouts caused by the Linux OOM killer te
 - Configurable thresholds and behavior
 - Dry-run mode for testing
 
+### Memory Snapshot Daemon (NEW in v1.7.0)
+- Continuous memory state logging every 30 seconds
+- Captures top 20 memory consumers with OOM scores
+- Tracks memory growth patterns to detect leaks
+- Correlates OOM events with actual memory usage
+- Identifies true root cause vs what kernel killed
+- Runs as systemd user service for persistence
+
 ### Command-Line Tools
 - **Memory Status Check** - View current memory usage and top consumers
 - **Browser Listing** - List all running browser instances with memory details
 - **OOM Analysis** - Analyze historical dmesg logs to identify past OOM events and root causes
+- **Snapshot Analysis** - Analyze memory trends and correlate with OOM events
 - **Service Management** - Enable, disable, check status, and view logs directly from the tool
 - **Flexible Configuration** - Override config file settings via command-line arguments
 
@@ -61,11 +72,24 @@ python3 ~/Utils/oom-tracker/memory_monitor.py --check
 # 2. Test in dry-run mode
 python3 ~/Utils/oom-tracker/memory_monitor.py --dry-run --threshold 50
 
-# 3. Enable automated monitoring
+# 3. Enable automated monitoring (kills browsers when memory is high)
 python3 ~/Utils/oom-tracker/memory_monitor.py --enable-service
 
-# 4. Monitor the logs
+# 4. Enable memory snapshot daemon (tracks true OOM causes)
+python3 ~/Utils/oom-tracker/memory_monitor.py --enable-snapshot-daemon
+
+# 5. Monitor the logs
 python3 ~/Utils/oom-tracker/memory_monitor.py --logs
+```
+
+### After an OOM Event or Reboot
+
+```bash
+# Find the TRUE culprit (not just what was killed)
+python3 ~/Utils/oom-tracker/memory_monitor.py --correlate-oom
+
+# See memory trends leading up to the event
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-snapshots 120
 ```
 
 ## Use Cases
@@ -98,6 +122,156 @@ Use dry-run mode to see what would happen without killing processes:
 ```bash
 python3 ~/Utils/oom-tracker/memory_monitor.py --dry-run --threshold 85
 ```
+
+## Finding the True Root Cause of OOM Events
+
+### The Problem
+
+When the Linux OOM killer activates, it often kills small processes (like `gsd-power` at 3MB) instead of the actual memory hog. This happens because:
+
+1. The OOM killer uses a scoring algorithm that considers process age, OOM score adjustments, and other factors - not just memory usage
+2. By the time the kernel logs the OOM event, the real culprit may have already released memory or been killed
+3. System logs only capture a snapshot at the moment of OOM, missing the buildup
+
+**Example of misleading OOM data:**
+```
+OOM killed: xdg-desktop-por (2.2 MB)
+Top consumers at OOM time: Xwayland (8 MB), tor (7 MB)
+```
+
+These tiny processes couldn't have caused OOM on a 32GB system. The real culprit was already gone.
+
+### The Solution: Continuous Memory Snapshots
+
+The memory snapshot daemon captures system state every 30 seconds, so you can see what was *actually* consuming memory before OOM events occur.
+
+### Step-by-Step Methodology
+
+#### Step 1: Enable Continuous Memory Snapshot Logging
+
+```bash
+# Option A: Run as a systemd user service (recommended - survives reboots)
+python3 ~/Utils/oom-tracker/memory_monitor.py --enable-snapshot-daemon
+
+# Option B: Run manually in background
+python3 ~/Utils/oom-tracker/memory_monitor.py --snapshot &
+```
+
+The daemon logs memory snapshots to `logs/memory-snapshots.jsonl` every 30 seconds (configurable).
+
+#### Step 2: Wait for OOM Event or Reboot
+
+Continue using your system normally. When an OOM event or unexpected reboot occurs, the snapshot data will be available for analysis.
+
+#### Step 3: Correlate OOM Events with Snapshots
+
+After an OOM event, run:
+
+```bash
+python3 ~/Utils/oom-tracker/memory_monitor.py --correlate-oom
+```
+
+**Example output:**
+```
+======================================================================
+OOM EVENT #1
+======================================================================
+Time:    2025-01-15T03:42:36+0000
+Killed:  gsd-power (PID 5688)
+
+Closest snapshot: 2025-01-15T03:42:12 (24s before OOM)
+System state: Mem 98.2%, Swap 87.3%
+
+Actual memory consumers at time of OOM:
+ #  Process                    Memory MB     Swap MB   OOM Score
+--- ------------------------- ------------ ---------- ----------
+ 1  claude                         2847.3      512.4        738
+ 2  chrome                         1523.8      234.1        801
+ 3  code                            892.4      156.2        650
+→4  gsd-power                         3.1        0.0        200
+
+--- ROOT CAUSE ANALYSIS ---
+MISMATCH: OOM killed gsd-power (3 MB)
+          But claude was using 2847 MB
+          → TRUE CULPRIT was likely claude
+```
+
+#### Step 4: Analyze Memory Trends
+
+To see memory growth patterns and identify leaking processes:
+
+```bash
+# Analyze last 60 minutes of snapshots
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-snapshots 60
+
+# Analyze last 2 hours
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-snapshots 120
+```
+
+**Example output:**
+```
+======================================================================
+TOP MEMORY CONSUMERS (by average)
+======================================================================
+ #  Process              Avg MB     Max MB    Swap MB   OOM Score     Growth
+--- -------------------- ---------- ---------- ---------- ---------- ----------
+ 1  claude                 1847.3     2847.3      512.4        738      +1200
+ 2  chrome                  892.4     1523.8      234.1        801       +631
+ 3  code                    654.2      892.4      156.2        650       +238
+
+======================================================================
+PROCESSES WITH SIGNIFICANT MEMORY GROWTH (>100MB)
+======================================================================
+  claude                    grew by +1200 MB (1647 MB → 2847 MB)
+  chrome                    grew by +631 MB (892 MB → 1523 MB)
+```
+
+#### Step 5: Take Action
+
+Once you identify the true culprit:
+
+1. **Adjust OOM scores** to make the culprit more likely to be killed:
+   ```bash
+   echo 1000 | sudo tee /proc/<PID>/oom_score_adj
+   ```
+
+2. **Lower the memory threshold** in `config.yaml` to kill browsers earlier:
+   ```yaml
+   memory_threshold_percent: 85  # instead of 90
+   ```
+
+3. **Protect critical session processes**:
+   ```bash
+   sudo python3 memory_monitor.py --protect-session
+   ```
+
+### Snapshot Daemon Management
+
+```bash
+# Check if snapshot daemon is running
+python3 ~/Utils/oom-tracker/memory_monitor.py --snapshot-status
+
+# View daemon logs
+journalctl --user -u oom-tracker-snapshot -f
+
+# Stop the snapshot daemon
+python3 ~/Utils/oom-tracker/memory_monitor.py --disable-snapshot-daemon
+
+# Change snapshot interval (default: 30 seconds)
+python3 ~/Utils/oom-tracker/memory_monitor.py --snapshot --snapshot-interval 15
+```
+
+### Quick Reference
+
+| Command | Purpose |
+|---------|---------|
+| `--snapshot` | Start continuous memory snapshot logging |
+| `--snapshot-interval N` | Set interval in seconds (default: 30) |
+| `--enable-snapshot-daemon` | Run as systemd user service |
+| `--disable-snapshot-daemon` | Stop the service |
+| `--snapshot-status` | Check daemon status |
+| `--analyze-snapshots N` | Analyze last N minutes of snapshots |
+| `--correlate-oom` | Match OOM events to snapshots |
 
 ## Installation
 
@@ -340,6 +514,66 @@ Recommendation: Consider limiting memory usage or adding more RAM/swap
 ============================================================
 ```
 
+### Memory Snapshot Daemon (NEW in v1.7.0)
+
+The memory snapshot daemon continuously logs system memory state to help identify the true root cause of OOM events.
+
+#### Start Snapshot Logging
+
+```bash
+# Run as a systemd user service (recommended)
+python3 ~/Utils/oom-tracker/memory_monitor.py --enable-snapshot-daemon
+
+# Or run manually (foreground)
+python3 ~/Utils/oom-tracker/memory_monitor.py --snapshot
+
+# Run with custom interval (default: 30 seconds)
+python3 ~/Utils/oom-tracker/memory_monitor.py --snapshot --snapshot-interval 15
+```
+
+#### Analyze Snapshots
+
+```bash
+# Analyze memory trends from last 60 minutes (default)
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-snapshots
+
+# Analyze last 2 hours
+python3 ~/Utils/oom-tracker/memory_monitor.py --analyze-snapshots 120
+```
+
+**Output includes:**
+- Top memory consumers by average usage
+- Memory growth patterns (potential leaks)
+- OOM kill predictions vs actual memory hogs
+- System memory trends over time
+
+#### Correlate OOM Events with Snapshots
+
+After an OOM event or reboot, find the true culprit:
+
+```bash
+python3 ~/Utils/oom-tracker/memory_monitor.py --correlate-oom
+```
+
+**This shows:**
+- Exact timestamp of each OOM event
+- What process was killed vs what was actually using memory
+- Memory state from the closest snapshot before OOM
+- Root cause analysis identifying mismatches
+
+#### Manage Snapshot Daemon
+
+```bash
+# Check daemon status
+python3 ~/Utils/oom-tracker/memory_monitor.py --snapshot-status
+
+# Stop the daemon
+python3 ~/Utils/oom-tracker/memory_monitor.py --disable-snapshot-daemon
+
+# View daemon logs
+journalctl --user -u oom-tracker-snapshot -f
+```
+
 ### Override Configuration Settings
 
 Override config.yaml settings from the command line:
@@ -389,7 +623,16 @@ These commands are simpler alternatives to using `systemctl` and `journalctl` di
 | `--version` | Show version number |
 | `--check` | Check memory status and exit (no action taken) |
 | `--list-browsers` | List all browser instances and exit |
-| **OOM Analysis (NEW v1.3.0)** | |
+| `--list-tabs` | List all browser tabs with memory usage |
+| **Memory Snapshots (NEW v1.7.0)** | |
+| `--snapshot` | Start continuous memory snapshot logging |
+| `--snapshot-interval N` | Interval between snapshots in seconds (default: 30) |
+| `--analyze-snapshots [MIN]` | Analyze snapshots from last N minutes (default: 60) |
+| `--correlate-oom` | Match OOM events with snapshots to find true culprit |
+| `--enable-snapshot-daemon` | Run snapshot logging as systemd user service |
+| `--disable-snapshot-daemon` | Stop the snapshot daemon |
+| `--snapshot-status` | Show snapshot daemon status |
+| **OOM Analysis** | |
 | `--analyze-oom [DAYS]` | Analyze journalctl for OOM events (default: 7 days) |
 | `--show-oom-scores` | Show OOM scores for all running processes |
 | `--protect-session` | Protect critical session processes from OOM killer (needs sudo) |
@@ -398,6 +641,7 @@ These commands are simpler alternatives to using `systemctl` and `journalctl` di
 | **Configuration** | |
 | `--dry-run` | Test mode - log actions without killing processes |
 | `--threshold N` | Override memory threshold (0-100) |
+| `--swap-threshold N` | Override swap threshold (0-100) |
 | `--config PATH` | Use alternate configuration file |
 | **Service Management** | |
 | `--enable-service` | Enable and start the systemd timer |
@@ -547,16 +791,19 @@ For analyzing dmesg logs, sudo is required to read `/var/log/dmesg*` files.
 
 ```
 ~/Utils/oom-tracker/
-├── memory_monitor.py       # Main Python script
-├── config.yaml            # Configuration file
-├── requirements.txt       # Python dependencies
-├── logs/                  # Log directory
-│   └── memory-monitor.log # Main log file
-└── README.md              # This file
+├── memory_monitor.py              # Main Python script
+├── config.yaml                    # Configuration file
+├── requirements.txt               # Python dependencies
+├── oom-tracker-snapshot.service   # Snapshot daemon service template
+├── logs/                          # Log directory
+│   ├── memory-monitor.log         # Main log file
+│   └── memory-snapshots.jsonl     # Memory snapshot data (JSONL format)
+└── README.md                      # This file
 
 ~/.config/systemd/user/
-├── oom-tracker.service    # Systemd service unit
-└── oom-tracker.timer      # Systemd timer unit
+├── oom-tracker.service            # Systemd service unit (proactive killing)
+├── oom-tracker.timer              # Systemd timer unit
+└── oom-tracker-snapshot.service   # Snapshot daemon service (if enabled)
 ```
 
 ## Maintenance
@@ -610,7 +857,36 @@ systemctl --user daemon-reload
 
 ## Version History
 
-### Version 1.3.0 (Current)
+### Version 1.7.0 (Current)
+- **NEW**: Memory snapshot daemon for tracking true OOM root causes
+  - `--snapshot` starts continuous memory snapshot logging
+  - `--snapshot-interval N` configures logging interval (default: 30s)
+  - `--enable-snapshot-daemon` runs as systemd user service
+  - `--disable-snapshot-daemon` stops the snapshot service
+  - `--snapshot-status` shows daemon status and snapshot file info
+- **NEW**: Snapshot analysis tools
+  - `--analyze-snapshots [MIN]` analyzes memory trends over time
+  - `--correlate-oom` matches OOM events with snapshots to identify true culprits
+  - Shows memory growth patterns to detect leaking processes
+  - Compares "what was killed" vs "what was actually using memory"
+- Enhanced `--analyze-oom` with ISO timestamp support for precise timing
+- Added comprehensive methodology documentation for OOM root cause analysis
+
+### Version 1.6.1
+- Added swap threshold triggering and detailed process reporting
+- Shows swap usage alongside memory in all reports
+- Process details include start time and elapsed runtime
+
+### Version 1.5.0
+- Added swap monitoring and reboot correlation to OOM analysis
+- `--analyze-oom` now shows system reboots alongside OOM events
+
+### Version 1.4.0
+- Added tab-level killing strategy (Strategy B)
+- `--list-tabs` shows all browser tabs with memory usage
+- Config option `kill_mode: tab` kills individual tabs before entire browser
+
+### Version 1.3.0
 - **NEW**: Added `--analyze-oom [DAYS]` to analyze journalctl logs for OOM events with detailed timeline
   - Automatically queries system logs and provides root cause analysis
   - Detects if session processes were killed (causing logout)
