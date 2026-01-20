@@ -7,7 +7,7 @@ _memory_monitor() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="--version --config --dry-run --threshold --swap-threshold --check
+    opts="--version --config --dry-run --threshold --swap-threshold --check --short
           --list-browsers --list-tabs --analyze-dmesg --analyze-oom --snapshot
           --snapshot-interval --analyze-snapshots --correlate-oom --protect-session
           --show-oom-scores --enable-service --disable-service --service-status

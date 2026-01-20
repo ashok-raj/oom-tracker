@@ -92,6 +92,12 @@ def setup_argparse():
     )
 
     parser.add_argument(
+        '--short',
+        action='store_true',
+        help='Display only memory and swap usage summary, then exit'
+    )
+
+    parser.add_argument(
         '--list-browsers',
         action='store_true',
         help='List all running browser instances and their memory usage, then exit'
@@ -1128,6 +1134,13 @@ def show_logs(follow=False):
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def short_memory_mode():
+    """Display only memory and swap usage summary."""
+    mem_usage = get_memory_usage()
+    print(f"Memory: {mem_usage['percent']:.1f}% ({mem_usage['used_gb']:.2f}/{mem_usage['total_gb']:.2f} GB)")
+    print(f"Swap:   {mem_usage['swap_percent']:.1f}% ({mem_usage['swap_used_gb']:.2f}/{mem_usage['swap_total_gb']:.2f} GB)")
 
 
 def check_memory_mode():
@@ -2300,6 +2313,10 @@ def main(args=None):
 
         if args.check:
             check_memory_mode()
+            return
+
+        if args.short:
+            short_memory_mode()
             return
 
         if args.list_browsers:
